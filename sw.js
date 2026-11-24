@@ -7,7 +7,7 @@
      أو فتح ./index.html?resume=1 إن لم توجد نافذة
    ========================================================= */
 
-const SW_VERSION = "v2.22";
+const SW_VERSION = "v2.23";
 const CACHE_NAME = "quizme-" + SW_VERSION;
 
 /* أصول الواجهة الأساسية — تُخزَّن مسبقًا عند التثبيت */
