@@ -1,0 +1,6968 @@
+'use strict';
+/* =========================================================
+   script.js — اختبرني (الإصدار 2.25)
+   المنطق الكامل للتطبيق:
+   - محرك الذكاء الاصطناعي (Google Gemini مع النماذج الاحتياطية وإصلاح JSON)
+   - تحليل النص: تقسيم إلى فقرات + 3 كلمات مفتاحية لكل فقرة + سياق عام
+   - أنماط أسئلة متعددة (اختيار من متعدد، صح/خطأ، أكمل الفراغ، تحليلي، متنوع ذكي)
+   - أساليب توليد: بكلمات مفتاحية / بدون كلمات مفتاحية / الاختبار المعمق (سؤال أو أكثر لكل فقرة حسب أفكارها الأساسية حتى 5)
+   - وسائل مساعدة ذكية (حذف خيارين 50:50، تلميح ذكي، قراءة صوتية TTS، تمييز بنجمة، ملاحظات المتعلم)
+   - دليل الدراسة الشامل + نظام الأوسمة والإنجازات + قوائم الحفظ والنسخ الاحتياطي
+   ========================================================= */
+
+/* =========================================================
+   1) محرك الذكاء الاصطناعي
+   ========================================================= */
+
+const DEFAULT_AI_MODELS = [
+  { id: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash Lite" },
+  { id: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite" },
+];
+
+let AI_MODELS = [...DEFAULT_AI_MODELS];
+
+/* شبكة أمان: نماذج احتياطية أخيرة تُجرَّب إذا فشلت النماذج المضبوطة — «gemini-flash-latest» اسم مستعار لا يتقاعد خلفيًا */
+const SAFETY_NET_MODELS = [
+  { id: "gemini-flash-latest", label: "Gemini Flash (Latest)" },
+  { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+];
+
+/* «نموذج التحليل القوي»: أقوى نموذج مجاني من غوغل حاليًا — بمعدل يومي محدود.
+   يُستخدم فقط في تقسيم الفقرات واستخراج الأفكار الأساسية (وليس توليد الأسئلة)،
+   وعند نفاد رصيد اليوم يعود التحليل تلقائيًا إلى النموذج المحدد في «النموذج». */
+const PRO_ANALYZE_MODEL = { id: "gemini-4-hydrogen", label: "Gemini 4 Hydrogen" };
+const PRO_DAILY_LIMIT = 20;
+let proAnalyzeOn = false;
+
+function proTodayKey() {
+  const d = new Date();
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+function proUsedToday() {
+  try {
+    const u = JSON.parse(store.get("ai_pro_usage") || "null");
+    if (u && u.date === proTodayKey() && Number.isInteger(u.count)) return u.count;
+  } catch {}
+  return 0;
+}
+function proQuotaRemaining() { return Math.max(0, PRO_DAILY_LIMIT - proUsedToday()); }
+function recordProAttempt() {
+  store.set("ai_pro_usage", JSON.stringify({ date: proTodayKey(), count: proUsedToday() + 1 }));
+}
+function loadProAnalyzePref() {
+  proAnalyzeOn = store.get("ai_pro_analyze") === "1";
+}
+function updateProQuotaUI() {
+  const leftEl = el("pro-quota-left");
+  if (leftEl) leftEl.textContent = String(proQuotaRemaining());
+  const note = el("pro-analyze-note");
+  if (note) note.textContent = proQuotaRemaining() === 0
+    ? t("pro_analyze_note_exhausted", { limit: PRO_DAILY_LIMIT })
+    : t("pro_analyze_note_avail");
+}
+
+/* ====== تخزين آمن ====== */
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
+};
+
+/* ====== إدارة مفتاح API ====== */
+function loadApiKey() {
+  return store.get("ai_api_key") || "";
+}
+function saveApiKeyToStorage(key) {
+  if (key) store.set("ai_api_key", key);
+  else store.del("ai_api_key");
+}
+
+/* ====== ضبط النماذج المخصصة ====== */
+function loadCustomModels() {
+  try {
+    const raw = store.get("ai_custom_models");
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed.primary && parsed.fallback) {
+        AI_MODELS = [
+          { id: parsed.primary, label: parsed.primary.split(":")[0] },
+          { id: parsed.fallback, label: parsed.fallback.split(":")[0] },
+        ];
+        return true;
+      }
+    }
+  } catch {}
+  return false;
+}
+
+function saveCustomModels(primary, fallback) {
+  store.set("ai_custom_models", JSON.stringify({ primary, fallback }));
+  AI_MODELS = [
+    { id: primary, label: primary.split(":")[0] },
+    { id: fallback, label: fallback.split(":")[0] },
+  ];
+}
+
+function resetCustomModels() {
+  store.del("ai_custom_models");
+  AI_MODELS = [...DEFAULT_AI_MODELS];
+}
+
+function setActiveModel(modelId) {
+  const fallbackLadder = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash"];
+  const fb = fallbackLadder.find((m) => m !== modelId) || SAFETY_NET_MODELS[0].id;
+  AI_MODELS = [
+    { id: modelId, label: modelId },
+    { id: fb, label: fb },
+  ];
+}
+
+/* ====== تحليل JSON متين ====== */
+function robustJSONParse(text) {
+  try { return JSON.parse(text); } catch {}
+
+  const match = text.match(/\{[\s\S]*\}/);
+  if (match) {
+    try { return JSON.parse(match[0]); } catch {}
+  }
+
+  let repaired = match ? match[0] : text;
+
+  let quoteCount = 0;
+  for (let i = 0; i < repaired.length; i++) {
+    if (repaired[i] === '"' && (i === 0 || repaired[i - 1] !== "\\")) quoteCount++;
+  }
+  if (quoteCount % 2 !== 0) repaired += '"';
+
+  let openBraces = 0, openBrackets = 0;
+  for (const ch of repaired) {
+    if (ch === "{") openBraces++;
+    else if (ch === "}") openBraces--;
+    else if (ch === "[") openBrackets++;
+    else if (ch === "]") openBrackets--;
+  }
+  while (openBrackets > 0) { repaired += "]"; openBrackets--; }
+  while (openBraces > 0) { repaired += "}"; openBraces--; }
+
+  try { return JSON.parse(repaired); } catch {}
+
+  const lastComma = repaired.lastIndexOf('",');
+  if (lastComma > 0) {
+    let truncated = repaired.substring(0, lastComma + 1);
+    let ob = 0, obr = 0;
+    for (const ch of truncated) {
+      if (ch === "{") ob++;
+      else if (ch === "}") ob--;
+      else if (ch === "[") obr++;
+      else if (ch === "]") obr--;
+    }
+    while (obr > 0) { truncated += "]"; obr--; }
+    while (ob > 0) { truncated += "}"; ob--; }
+    try { return JSON.parse(truncated); } catch {}
+  }
+
+  return null;
+}
+
+/* ====== تحويل الرسائل: OpenAI-style ← Gemini ====== */
+function convertMessagesToGeminiFormat(messages) {
+  const result = [];
+  let systemInstruction = null;
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      systemInstruction = systemInstruction ? systemInstruction + "\n\n" + msg.content : msg.content;
+    } else if (msg.role === "user") {
+      result.push({ role: "user", parts: [{ text: msg.content }] });
+    } else if (msg.role === "assistant") {
+      result.push({ role: "model", parts: [{ text: msg.content }] });
+    }
+  }
+  const body = { contents: result };
+  if (systemInstruction) {
+    body.systemInstruction = { role: "system", parts: [{ text: systemInstruction }] };
+  }
+  return body;
+}
+
+/* ====== تحويل الاستجابة: Gemini ← OpenAI-like ====== */
+function convertGeminiResponseToOpenAIFormat(geminiData) {
+  if (geminiData.error) return { error: geminiData.error };
+
+  if (geminiData.promptFeedback && geminiData.promptFeedback.blockReason) {
+    return { error: { message: t("err_blocked_req", { reason: geminiData.promptFeedback.blockReason }) } };
+  }
+
+  const candidate = geminiData.candidates && geminiData.candidates[0];
+  if (!candidate) return { error: { message: t("err_empty_gemini") } };
+
+  if (candidate.finishReason === "SAFETY") {
+    return { error: { message: t("err_blocked_safety") } };
+  }
+
+  const parts = (candidate.content && candidate.content.parts) || [];
+  const text = parts.map((p) => p.text).filter(Boolean).join("").trim();
+  if (!text) return { error: { message: t("err_empty_gemini") } };
+
+  return {
+    choices: [{ message: { content: text }, finishReason: candidate.finishReason }],
+  };
+}
+
+/* ====== الاستدعاء الرئيسي مع النماذج الاحتياطية ====== */
+async function callGoogleAIStudioWithFallback({ body, signal, timeoutMs = 30000, modelsOverride = null }) {
+  const apiKey = loadApiKey();
+  if (!apiKey) throw new Error(t("err_no_api_key"));
+
+  let lastError = null;
+  const failures = []; /* تفاصيل فشل كل نموذج — لتشخيص أدق عند فشل الجميع */
+  const PER_MODEL_TIMEOUT = timeoutMs;
+
+  const geminiBody = convertMessagesToGeminiFormat(body.messages || []);
+  geminiBody.generationConfig = geminiBody.generationConfig || {};
+  if (body.temperature !== undefined) geminiBody.generationConfig.temperature = body.temperature;
+  if (body.max_tokens !== undefined) geminiBody.generationConfig.maxOutputTokens = body.max_tokens;
+  if (body.jsonSchema) {
+    geminiBody.generationConfig.responseMimeType = "application/json";
+    geminiBody.generationConfig.responseSchema = body.jsonSchema;
+  }
+
+  /* modelsOverride: سلسلة نماذج بديلة للطلب الواحد (مثل تقديم «نموذج التحليل القوي») — وإلا تُستخدم النماذج المضبوطة */
+  const attempts = (Array.isArray(modelsOverride) && modelsOverride.length)
+    ? [...modelsOverride]
+    : [...AI_MODELS];
+  for (const sm of SAFETY_NET_MODELS) {
+    if (!attempts.some((m) => m.id === sm.id)) attempts.push(sm);
+  }
+  const triedModels = [];
+
+  for (let i = 0; i < attempts.length; i++) {
+    const model = attempts[i];
+    triedModels.push(model.id);
+    const perModelController = new AbortController();
+    const perModelTimer = setTimeout(() => perModelController.abort(), PER_MODEL_TIMEOUT);
+
+    let externalAbortHandler = null;
+    if (signal) {
+      if (signal.aborted) {
+        clearTimeout(perModelTimer);
+        lastError = new Error(t("err_aborted"));
+        continue;
+      }
+      externalAbortHandler = () => perModelController.abort();
+      signal.addEventListener("abort", externalAbortHandler);
+    }
+
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model.id)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+      const res = await fetch(url, {
+        method: "POST",
+        signal: perModelController.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(geminiBody),
+      });
+
+      if (!res.ok) {
+        let errDetail = "";
+        try { errDetail = await res.text(); } catch {}
+        console.warn(`[API] فشل النموذج ${model.label} (HTTP ${res.status}): ${errDetail.slice(0, 200)}`);
+        const failMsg = `HTTP ${res.status}: ${errDetail.slice(0, 140)}`;
+        failures.push({ model: model.id, msg: failMsg });
+        lastError = new Error(failMsg);
+        continue;
+      }
+
+      const rawData = await res.json();
+
+      if (rawData.error) {
+        const errMsg = rawData.error.message || JSON.stringify(rawData.error);
+        console.warn(`[API] المزوّد أرجع خطأ للنموذج ${model.label}: ${errMsg}`);
+        failures.push({ model: model.id, msg: errMsg });
+        lastError = new Error(errMsg);
+        continue;
+      }
+
+      const data = convertGeminiResponseToOpenAIFormat(rawData);
+      if (data.error) {
+        console.warn(`[API] خطأ في استجابة النموذج ${model.label}: ${data.error.message}`);
+        failures.push({ model: model.id, msg: data.error.message });
+        lastError = new Error(data.error.message);
+        continue;
+      }
+
+      const content = data.choices && data.choices[0] && data.choices[0].message.content;
+      if (!content) {
+        console.warn(`[API] استجابة فارغة للنموذج ${model.label}`);
+        const emptyMsg = t("err_empty_resp");
+        failures.push({ model: model.id, msg: emptyMsg });
+        lastError = new Error(emptyMsg);
+        continue;
+      }
+
+      console.log(`[API] نجح النموذج ${model.label}`);
+      return { data, usedModel: model.id, triedModels };
+    } catch (err) {
+      if (signal && signal.aborted) throw err;
+      console.warn(`[API] فشل النموذج ${model.label}: ${err && err.message}`);
+      failures.push({ model: model.id, msg: (err && err.message) || "network error" });
+      lastError = err;
+      continue;
+    } finally {
+      clearTimeout(perModelTimer);
+      if (signal && externalAbortHandler) signal.removeEventListener("abort", externalAbortHandler);
+    }
+  }
+
+  if (failures.length) {
+    const first = failures[0];
+    throw new Error(
+      failures.length > 1
+        ? `${first.msg} (${t("err_tried_models")}: ${triedModels.join(" → ")})`
+        : first.msg
+    );
+  }
+  throw lastError || new Error(t("err_all_models_failed"));
+}
+
+/* =========================================================
+   2) مهام التطبيق عبر الذكاء الاصطناعي (Gemini)
+   ========================================================= */
+
+const MAX_PARAGRAPHS = 100;
+
+function buildSystemAnalyze(limit, deep = false) {
+  if (isEn()) {
+    const rule1 = limit > 0
+      ? `1. Split the text into EXACTLY ${limit} passages — this count was explicitly requested by the user and is top priority (neither more nor fewer). If natural paragraphs are fewer than ${limit}, split longer passages by topic or related sentences to reach ${limit}; if the text is too short, split into as many meaningful passages as possible (ideally 3–10 lines each).`
+      : `1. Split the text into passages (3 to ${MAX_PARAGRAPHS} passages as appropriate; longer texts get more passages). If the text is a single block, divide it by topic or coherent sentence groups so each passage has clear meaning (ideally 3–10 lines each).`;
+    const purpose = deep
+      ? "Purpose of splitting: Each passage will be used in Deep Quiz mode to generate one question per extracted core idea. Split at genuine topic boundaries so every passage is a cohesive thematic unit (1 to 5 sequential core ideas) without mixing unrelated topics or creating trivial filler passages."
+      : "Purpose of splitting: Each passage will be used to generate one self-contained quiz question. Split at genuine topic boundaries so every passage carries a coherent core idea with enough substance for a focused question.";
+    const ideasRule = deep
+      ? "4. For each passage, extract its core ideas in order of appearance into the `ideas` array: each idea is a concise statement capturing one distinct, testable fact, concept, definition, or cause-and-effect relationship (1 idea for a simple passage, up to 5 for a rich passage), non-overlapping and covering the passage's substance without repetition.\n"
+      : "";
+    const contextRuleNum = deep ? "5" : "4";
+    return `You are an educational expert specializing in text analysis and quiz creation.
+Your task: Analyze the user's text and return ONLY valid JSON.
+${purpose}
+Rules:
+${rule1}
+2. Copy each passage's text verbatim (trimming only extra outer whitespace), strictly preserving original line breaks, headings, and standalone lines — never flatten multiple lines into a single line, and do not omit any part of the text.
+3. For each passage, extract EXACTLY 3 distinct keywords that appear verbatim in the passage and carry substantive meaning (no stopwords or prepositions).
+${ideasRule}${contextRuleNum}. Write a concise overall context summary (3 to 5 sentences) in the same language as the input text.
+Return JSON only with no extra explanation.`;
+  }
+  const rule1 = limit > 0
+    ? `1. قسّم النص إلى ${limit} فقرة بالضبط — هذا العدد طلبه المستخدم صراحةً وهو أولوية قصوى يجب الالتزام به (لا أكثر ولا أقل). إذا كانت فقرات النص الطبيعية أقل من ${limit}، فكّك الفقرات الطويلة إلى فقرات أصغر حسب المواضيع أو مجموعات الجمل المتقاربة حتى تبلغ ${limit} فقرة، وما تعذّر بلوغ العدد كاملًا لتقصّر النص قسّمه إلى أكبر عدد ممكن من الفقرات المفهومة. احرص على أن تكون كل فقرة ناتجة تشتمل على معاني مفهومة ويفضل أن تكون الفقرة الواحدة بين 3 إلى 10 أسطر.`
+    : `1. قسّم النص إلى فقرات (من 3 إلى ${MAX_PARAGRAPHS} فقرة قدر الإمكان، وكلما كان النص أطول زاد عدد الفقرات). إذا كان النص كتلة واحدة متصلة، قسّمه حسب المواضيع أو مجموعات الجمل المتقاربة، احرص على أن تكون كل فقرة ناتجة تشتمل على معاني مفهومة ويفضل أن تكون الفقرة الواحدة بين 3 إلى 10 أسطر.`;
+  const purpose = deep
+    ? "الغاية من التقسيم (ادركها جيدًا قبل القسمة): كل فقرة ستُستخدم لاحقًا في «الاختبار المعمق» لتوليد سؤال اختبار لكل فكرة أساسية تستخرجها أنت من الفقرة — فالتقسيم ليس شكليًا ولا عشوائيًا؛ قسّم عند حدود المواضيع الحقيقية بحيث تكون كل فقرة كتلة موضوعية واحدة متماسكة قد تضم فكرة أساسية واحدة أو عدة أفكار أساسية متسلسلة، ولا تجمع في فقرة واحدة موضوعين متباعدين لا يرتبطان بموضوع واحد، ولا تجعل فقرة هامشية قليلة الجوهر لا تصلح لأسئلة. وعند وجود عدد محدد مطلوب من الفقرات وازن بين الالتزام بالعدد المطلوب وبين تماسك الموضوع الواحد في كل فقرة."
+    : "الغاية من التقسيم (ادركها جيدًا قبل القسمة): كل فقرة ستُستخدم لاحقًا لتوليد سؤال اختبار واحد مستقل عنها — فالتقسيم ليس شكليًا ولا عشوائيًا؛ قسّم عند حدود المواضيع الحقيقية بحيث تغطي كل فقرة فكرة واحدة متماسكة تحمل معلومات جوهرية كافية لصياغة سؤال مركّز يُجاب منها وحدها، ولا تجمع في فقرة واحدة موضوعين متباعدين يعذّر معهما تحديد سؤال مركز، ولا تجعل فقرة هامشية قليلة الجوهر لا تصلح لسؤال. وعند وجود عدد محدد مطلوب من الفقرات وازن بين الالتزام بالعدد المطلوب وبين وحدة الفكرة في كل فقرة.";
+  const ideasRule = deep
+    ? "4. لكل فقرة استخرج أفكارها الأساسية مرتبة حسب ترتيب ورودها في الفقرة وضعها في حقل ideas: الفكرة الواحدة عبارة موجزة تصوغ معلومة أو مفهومًا أو تعريفًا أو علاقة سبب ونتيجة جوهرية واحدة قابلة للاختبار مستقلة عن باقي الأفكار، وعدد الأفكار تقرره أنت بحسب غنى الفقرة (فكرة واحدة إذا كانت الفقرة بسيطة، وعلى الأكثر 5 أفكار للفقرة الغنية جدًا)، بشرط أن تكون الأفكار مختلفة غير متداخلة، وأن تغطي مجتمعةً جوهر الفقرة دون إغفال معلومة مهمة فيها ودون تكرار.\n"
+    : "";
+  const contextRuleNum = deep ? "5" : "4";
+  return `أنت خبير تعليمي متخصص في تحليل النصوص وإنشاء اختبارات.
+مهمتك: تحليل النص الذي يرسله المستخدم وإرجاع النتيجة بصيغة JSON فقط.
+${purpose}
+القواعد:
+${rule1}
+2. انسخ نص كل فقرة كما ورد حرفيًا مع تقليم المسافات الزائدة فقط، واحرص على الحفاظ الكامل على بنية الأسطر الأصلية: كل سطر يبقى في سطر مستقل بفواصل الأسطر نفسها، والعناوين والعبارات المستقلة تبقى في أسطر مستقلة مميزة ولا تُدمج أبدًا مع الجمل التي تليها في سطر واحد، ولا تحوّل الفقرة إلى كتلة نص واحدة مسطّحة. لا تهدر أي جزء من النص أثناء التقسيم.
+3. لكل فقرة استخرج بالضبط 3 كلمات مفتاحية: كلمات مهمة وردت حرفيًا داخل الفقرة، ذات محتوى دلالي (ليست أدوات نحو أو حروف جر أو كلمات شائعة)، ومختلفة عن بعضها.
+${ideasRule}${contextRuleNum}. اكتب سياقًا عامًا موجزًا (من ثلاث إلى خمسة جمل) يلخص موضوع النص كله بنفس لغة النص.
+أعد JSON فقط دون أي شرح إضافي.`;
+}
+
+/* مخطط التحليل: في «الاختبار المعمق» يُضاف حقل ideas لكل فقرة (الأفكار الأساسية المرتبة) */
+function buildAnalyzeSchema(deep = false) {
+  const paraProps = {
+    text: { type: "STRING" },
+    keywords: { type: "ARRAY", items: { type: "STRING" } },
+  };
+  const paraRequired = ["text", "keywords"];
+  if (deep) {
+    paraProps.ideas = {
+      type: "ARRAY",
+      items: { type: "STRING" },
+      description: "الأفكار الأساسية المرتبة للفقرة: من فكرة واحدة إلى خمس بحسب غناها، كل فكرة عبارة موجزة قابلة للاختبار",
+    };
+    paraRequired.push("ideas");
+  }
+  return {
+    type: "OBJECT",
+    properties: {
+      context: { type: "STRING" },
+      paragraphs: {
+        type: "ARRAY",
+        items: {
+          type: "OBJECT",
+          properties: paraProps,
+          required: paraRequired,
+        },
+      },
+    },
+    required: ["context", "paragraphs"],
+  };
+}
+
+const SYSTEM_QUIZ = `أنت مختص في تأليف أسئلة تعليمية باللغة العربية بناءً على فقرات نصية.
+ستستقبل: السياق العام للنص، فقرة واحدة، وكلمة مفتاحية من هذه الفقرة.
+المطلوب: سؤال واحد حول الكلمة المفتاحية في سياقها داخل الفقرة وفق النمط المحدد.
+القواعد الصارمة:
+1. السؤال يجب أن يكون قابلًا للإجابة من الفقرة نفسها فقط، ولا تفترض معرفة المستخدم للفقرة مسبقًا ولا تشر لوجودها (لا تستخدم عبارات مثل «حسب الفقرة» أو «كما ورد في النص» أو «الفقرة السابقة») — صغ السؤال ليكون مفهومًا بمفرده.
+2. التزم بعدد الخيارات المحدد في النمط (4 خيارات للاختيار من متعدد وأكمل الفراغ والتحليلي، أو خياران فقط لسؤال صح أم خطأ).
+3. correctIndex هو رقم الخيار الصحيح (يبدأ من 0).
+4. explanation: تعليل موجز للإجابة الصحيحة مستند إلى ما ورد حرفيًا في الفقرة.
+5. اجعل السؤال واضحًا ومباشرًا وبنفس لغة النص (ما لم تُحدَّد لغة أخرى للسؤال).
+أعد JSON فقط.`;
+
+const SYSTEM_QUIZ_FOCUSED = `أنت مختص في تأليف أسئلة تعليمية باللغة العربية بناءً على فقرات نصية.
+ستستقبل: السياق العام للنص وفقرة واحدة، دون كلمة مفتاحية محددة.
+المطلوب: سؤال واحد يختبر الفكرة المحورية أو المعلومة الجوهرية في الفقرة (المفهوم الأساس، العلاقة بين الأفكار، السبب والنتيجة، التعريف أو الاستنتاج المباشر) وفق النمط المحدد.
+القواعد الصارمة:
+1. السؤال يجب أن يكون قابلًا للإجابة من الفقرة نفسها فقط، ولا تفترض معرفة المستخدم للفقرة مسبقًا ولا تشر لوجودها (لا تستخدم عبارات مثل «حسب الفقرة» أو «كما ورد في النص» أو «الفقرة السابقة») — صغ السؤال ليكون مفهومًا بمفرده، ولا تربطه بكلمة واحدة بعينها بل بالمعنى الكلي للفقرة.
+2. التزم بعدد الخيارات المحدد في النمط (4 خيارات للاختيار من متعدد وأكمل الفراغ والتحليلي، أو خياران فقط لسؤال صح أم خطأ).
+3. correctIndex هو رقم الخيار الصحيح (يبدأ من 0).
+4. explanation: تعليل موجز للإجابة الصحيحة مستند إلى ما ورد حرفيًا في الفقرة.
+5. اجعل السؤال واضحًا ومباشرًا وبنفس لغة النص (ما لم تُحدَّد لغة أخرى للسؤال).
+أعد JSON فقط.`;
+
+const SYSTEM_QUIZ_EN = `You are an expert educational assessment author creating quiz questions from text passages.
+You will receive: the overall text context, one passage, and a keyword from that passage.
+Task: Write ONE question testing that keyword in its context within the passage according to the requested format.
+Strict rules:
+1. The question must be answerable solely from the passage, yet self-contained — never assume the reader saw the passage and never reference it (avoid phrases like "According to the passage", "As stated in the text", or "In the paragraph above").
+2. Match the exact option count for the format (4 options for MCQ, fill-in-the-blank, and analytical; 2 options only for True/False).
+3. correctIndex is the 0-based index of the correct option.
+4. explanation: a concise justification grounded directly in the passage.
+5. Write clearly and directly in the same language as the passage (unless another question language is explicitly specified).
+Return JSON only.`;
+
+const SYSTEM_QUIZ_FOCUSED_EN = `You are an expert educational assessment author creating quiz questions from text passages.
+You will receive: the overall text context and one passage (without a specific keyword).
+Task: Write ONE question testing the passage's core idea or essential insight (main concept, relationship, cause & effect, definition, or direct inference) according to the requested format.
+Strict rules:
+1. The question must be answerable solely from the passage, yet self-contained — never assume the reader saw the passage and never reference it (avoid phrases like "According to the passage" or "As mentioned in the text").
+2. Match the exact option count for the format (4 options for MCQ, fill-in-the-blank, and analytical; 2 options only for True/False).
+3. correctIndex is the 0-based index of the correct option.
+4. explanation: a concise justification grounded directly in the passage.
+5. Write clearly and directly in the same language as the passage (unless another question language is explicitly specified).
+Return JSON only.`;
+
+const SYSTEM_QUIZ_DEEP_EN = `You are an expert educational assessment author creating quiz questions from text passages.
+You will receive: the overall text context, one passage, and ONE specific core idea extracted from that passage.
+Task: Write ONE question testing ONLY that specific core idea in context according to the requested format.
+Strict rules:
+1. Test ONLY the given core idea without bleeding into other ideas from the passage (other ideas have their own separate questions). Make it answerable solely from the passage and completely self-contained (never say "According to the passage" or "As stated in the text").
+2. Match the exact option count for the format (4 options for MCQ, fill-in-the-blank, and analytical; 2 options only for True/False).
+3. correctIndex is the 0-based index of the correct option.
+4. explanation: a concise justification grounded directly in the passage.
+5. Write clearly and directly in the same language as the passage (unless another question language is explicitly specified).
+Return JSON only.`;
+
+function buildSystemQuiz(useKeywords) {
+  if (isEn()) return useKeywords ? SYSTEM_QUIZ_EN : SYSTEM_QUIZ_FOCUSED_EN;
+  return useKeywords ? SYSTEM_QUIZ : SYSTEM_QUIZ_FOCUSED;
+}
+
+/* «الاختبار المعمق»: سؤال يختبر فكرة أساسية واحدة محددة من أفكار الفقرة */
+const SYSTEM_QUIZ_DEEP = `أنت مختص في تأليف أسئلة تعليمية باللغة العربية بناءً على فقرات نصية.
+ستستقبل: السياق العام للنص، فقرة واحدة، وفكرة أساسية واحدة من الأفكار الأساسية المستخرجة من هذه الفقرة.
+المطلوب: سؤال واحد يختبر هذه الفكرة الأساسية تحديدًا في سياقها داخل الفقرة وفق النمط المحدد.
+القواعد الصارمة:
+1. السؤال يجب أن يتناول الفكرة الأساسية المعطاة وحدها ولا يمتد إلى أفكار أخرى من الفقرة (لكل فكرة أخرى سؤال مستقل خاص بها)، ويجب أن يكون قابلًا للإجابة من الفقرة نفسها فقط، ولا تفترض معرفة المستخدم للفقرة مسبقًا ولا تشر لوجودها (لا تستخدم عبارات مثل «حسب الفقرة» أو «كما ورد في النص» أو «الفقرة السابقة») — صغ السؤال ليكون مفهومًا بمفرده وبمعزل عن بقية أفكار الفقرة.
+2. التزم بعدد الخيارات المحدد في النمط (4 خيارات للاختيار من متعدد وأكمل الفراغ والتحليلي، أو خياران فقط لسؤال صح أم خطأ).
+3. correctIndex هو رقم الخيار الصحيح (يبدأ من 0).
+4. explanation: تعليل موجز للإجابة الصحيحة مستند إلى ما ورد حرفيًا في الفقرة.
+5. اجعل السؤال واضحًا ومباشرًا وبنفس لغة النص (ما لم تُحدَّد لغة أخرى للسؤال).
+أعد JSON فقط.`;
+
+/* توجيه الصيغ: يُبلغ النموذج بالصيغ المدعومة في خانات السؤال/الخيارات/التعليل ليستخدمها قدر الحاجة */
+const FORMATS_DIRECTIVE_AR = [
+  "الصيغ المدعومة في نص السؤال والخيارات والتعليل (استخدمها قدر الحاجة فقط):",
+  "- Markdown: عريض **هكذا** للتمييز المهم، مائل *هكذا*، قوائم عند التعداد، جداول عند المقارنة، وروابط عند الاقتضاء.",
+  "- المعادلات الرياضية بصيغة LaTeX: داخل $..$ للسطري و$$..$$ للعرض (أو \\(..\\) و\\[..\\]) — خاصة في أسئلة العلوم والرياضيات والوحدات والأرقام.",
+  "- كتل ```mermaid للمخططات والصور مدعومة تقنيًا، لكن لا تستخدمها إلا عند حاجة تعليمية حقيقية في نص السؤال أو التعليل، ولا تضعها أبدًا داخل الخيارات.",
+  "- لا تفرض التنسيق على أسئلة نصية بسيطة: النص العادي الواضح أفضل عندما لا يضيف التنسيق قيمة.",
+].join("\n");
+const FORMATS_DIRECTIVE_EN = [
+  "Supported formatting in question, options, and explanation (use only when genuinely helpful):",
+  "- Markdown: **bold** for emphasis, *italics*, lists, tables for comparisons, and links when appropriate.",
+  "- LaTeX math: $..$ inline and $$..$$ display (or \\(..\\) and \\[..\\]) for science/math formulas and units.",
+  "- ```mermaid diagram blocks are supported in question or explanation only when educationally valuable; never put them inside options.",
+  "- Do not force formatting onto simple text questions: clear plain text is best when formatting adds no value.",
+].join("\n");
+function getFormatsDirective() { return isEn() ? FORMATS_DIRECTIVE_EN : FORMATS_DIRECTIVE_AR; }
+
+const SCHEMA_QUESTION = {
+  type: "OBJECT",
+  properties: {
+    /* «متنوع ذكي»: qType أول حقل — Gemini يولّد الحقول تسلسليًا وفق propertyOrdering،
+       فبتحديد النمط أولًا يُلزَم باختياره قبل صياغة السؤال، بدل أن يكتب سؤالًا قياسيًا
+       بـ 4 خيارات ثم يوسمه "mcq" بعد أن يكون قد التزم به فعليًا. */
+    qType: {
+      type: "STRING",
+      enum: ["mcq", "tf", "fill", "why"],
+      description: "رمز نمط السؤال المختار بعد تحليل طبيعة الفقرة — حدّده أولًا قبل كتابة نص السؤال",
+    },
+    question: { type: "STRING" },
+    options: { type: "ARRAY", items: { type: "STRING" } },
+    correctIndex: { type: "INTEGER" },
+    explanation: { type: "STRING" },
+  },
+  required: ["qType", "question", "options", "correctIndex", "explanation"],
+  /* ترتيب التوليد الفعلي: النمط أولًا ثم السؤال والخيارات الموافقة له */
+  propertyOrdering: ["qType", "question", "options", "correctIndex", "explanation"],
+};
+
+/* --- تحليل النص --- */
+async function aiAnalyzeText(text, signal, limit = 0, deep = false) {
+  const paraLimit = limit > 0 ? Math.min(limit, MAX_PARAGRAPHS) : 0;
+  const body = {
+    messages: [
+      { role: "system", content: buildSystemAnalyze(paraLimit, deep) },
+      {
+        role: "user",
+        content: isEn()
+          ? `Analyze the following text:\n\n"""\n${text}\n"""\n\nReminder: When copying each passage, preserve original line breaks and headings verbatim — do not merge separate lines into one.` +
+            (paraLimit > 0 ? `\n\nImportant: Split the text above into EXACTLY ${paraLimit} passages (no more, no fewer) as specified.` : "")
+          : `حلّل النص التالي:\n\n"""\n${text}\n"""\n\nتنبيه: عند نسخ نص كل فقرة حافظ على فواصل الأسطر والعناوين كما وردت في النص الأصلي تمامًا — لا تدمج الأسطر المتجاورة في سطر واحد.` +
+            (paraLimit > 0 ? `\n\nتنبيه مهم: قسّم النص أعلاه إلى ${paraLimit} فقرة بالضبط (لا أكثر ولا أقل) كما هو مطلوب في القواعد.` : ""),
+      },
+    ],
+    temperature: 0.4,
+    max_tokens: deep ? 12288 : 8192,
+    jsonSchema: buildAnalyzeSchema(deep),
+  };
+  /* «نموذج التحليل القوي»: عند تفعيله وتوفر رصيد اليوم يُقدَّم على النماذج المضبوطة — في هذا الطلب فقط (تقسيم وأفكار) */
+  const usePro = proAnalyzeOn && proQuotaRemaining() > 0;
+  const modelsOverride = usePro ? [PRO_ANALYZE_MODEL, ...AI_MODELS] : null;
+  const { data, triedModels } = await callGoogleAIStudioWithFallback({ body, signal, timeoutMs: 60000, modelsOverride });
+  /* الرصيد يُحسب عند المحاولة الفعلية بالقوي (كما تُحسبه غوغل) — حتى لو فشل وتسلّل البديل */
+  if (usePro && Array.isArray(triedModels) && triedModels.includes(PRO_ANALYZE_MODEL.id)) {
+    recordProAttempt();
+    updateProQuotaUI();
+  }
+  const parsed = robustJSONParse(data.choices[0].message.content);
+  if (!parsed || !Array.isArray(parsed.paragraphs) || !parsed.paragraphs.length) {
+    throw new Error(t("err_parse_analysis"));
+  }
+  let paragraphs = parsed.paragraphs
+    .map((p) => ({
+      text: String((p && p.text) || "").trim(),
+      keywords: normalizeKeywords(p && p.keywords, String((p && p.text) || "")),
+      ideas: deep ? normalizeIdeas(p && p.ideas) : [],
+    }))
+    .filter((p) => p.text.length > 0);
+  if (!paragraphs.length) throw new Error(t("err_no_paragraphs"));
+  const cap = paraLimit > 0 ? paraLimit : MAX_PARAGRAPHS;
+  if (paragraphs.length > cap) {
+    paragraphs = mergeParagraphObjects(paragraphs, cap);
+  }
+  const context = String(parsed.context || "").trim() || paragraphs[0].text.slice(0, 160);
+  return { context, paragraphs };
+}
+
+function mergeParagraphObjects(paragraphs, target) {
+  if (paragraphs.length <= target) return paragraphs;
+  const base = Math.floor(paragraphs.length / target);
+  const extra = paragraphs.length % target;
+  const out = [];
+  let idx = 0;
+  for (let g = 0; g < target; g++) {
+    const size = base + (g < extra ? 1 : 0);
+    const chunk = paragraphs.slice(idx, idx + size);
+    idx += size;
+    const text = chunk.map((p) => p.text).join("\n");
+    out.push({
+      text,
+      keywords: normalizeKeywords(chunk.flatMap((p) => p.keywords || []), text),
+      ideas: normalizeIdeas(chunk.flatMap((p) => p.ideas || [])),
+    });
+  }
+  return out;
+}
+
+function normalizeKeywords(raw, paragraphText) {
+  let kws = Array.isArray(raw) ? raw.map((k) => String(k).trim()).filter(Boolean) : [];
+  kws = [...new Set(kws)].slice(0, 3);
+  while (kws.length < 3) {
+    const extra = localExtractKeywords(paragraphText, kws);
+    if (!extra.length) break;
+    kws.push(extra[0]);
+  }
+  return kws;
+}
+
+/* ====== «الاختبار المعمق»: الأفكار الأساسية ====== */
+const DEEP_MAX_IDEAS = 5;
+
+/* تنظيف أفكار الفقرة القادمة من النموذج: نص فقط، بلا تكرار، وبحد أقصى 5 أفكار */
+function normalizeIdeas(raw) {
+  let ideas = Array.isArray(raw) ? raw.map((s) => String(s).trim()).filter(Boolean) : [];
+  return [...new Set(ideas)].slice(0, DEEP_MAX_IDEAS);
+}
+
+/* عدد أسئلة «الاختبار المعمق» المتوقع من فقرات تحليل معطاة (فكرة لكل سؤال، وفقرة بلا أفكار = سؤال واحد) */
+function countDeepQuestions(paragraphs) {
+  return (Array.isArray(paragraphs) ? paragraphs : []).reduce((n, p) => {
+    const c = Array.isArray(p && p.ideas) ? p.ideas.filter(Boolean).length : 0;
+    return n + (c || 1);
+  }, 0);
+}
+
+/* ====== أنماط الأسئلة (Question Types) ====== */
+const Q_TYPE_KEYS = new Set(["mcq", "tf", "fill", "why", "mix"]);
+function getQTypeLabel(v) {
+  return t("q_type_" + (v || "mcq"));
+}
+const Q_TYPE_LABELS = new Proxy({}, { get: (_, k) => Q_TYPE_KEYS.has(k) ? getQTypeLabel(k) : undefined });
+/* «متنوع ذكي»: آخر نمط ولّده النموذج لكل فقرة — لمنع تكرار النمط في الجولات الجديدة وعند إعادة التوليد */
+const mixTypeHistory = new Map();
+/* «متنوع ذكي»: أنماط الأسئلة المولَّدة في الجولة الحالية بالترتيب — لتنويع الأنماط داخل الجولة الواحدة */
+const mixRoundTypes = [];
+let qType = "mix"; /* الافتراضي: «متنوع ذكي» بطلب المستخدم */
+
+function loadQType() {
+  const v = store.get("quiz_q_type");
+  qType = Q_TYPE_LABELS[v] ? v : "mix";
+}
+function getQType() { return qType; }
+function syncQTypeUI() {
+  const sel = el("q-type");
+  if (sel) sel.value = qType;
+}
+function setQType(v, silent) {
+  if (!Q_TYPE_LABELS[v]) return;
+  qType = v;
+  store.set("quiz_q_type", v);
+  syncQTypeUI();
+  if (!silent) {
+    toast("info", t("toast_q_type", { label: getQTypeLabel(v) }));
+  }
+}
+
+function resolveEffectiveQType() {
+  /* «متنوع ذكي» يُمرَّر كما هو: النموذج يحلّل الفقرة ويختار النمط الأنسب بنفسه (بدل التناوب الحسابي الثابت) */
+  return qType;
+}
+
+function buildQuestionTypeDirective(effectiveType, avoidType, recentTypes) {
+  const rt = Array.isArray(recentTypes) ? recentTypes : [];
+  if (isEn()) {
+    if (effectiveType === "mix") {
+      const avoidNote = avoidType
+        ? `\n\nVariety note: The previous question for this passage used "${avoidType}" — choose a different format this time unless this passage only fits that format.`
+        : "";
+      const roundNote = rt.length >= 2 && rt[0] && rt[0] === rt[1]
+        ? `\n\nRound variety note: The last two questions were both "${rt[0]}" — pick a different format if the passage allows.`
+        : "";
+      return `Question Format: Smart Mix (2 steps):\nStep 1: Analyze the passage and decide its strongest angle (rich comparisons/details, a key term/definition, or cause-and-effect/reasoning).\nStep 2: Pick the best format from these three and set qType FIRST in the JSON:\n- "mcq" (4-option multiple choice): only if the passage has rich branching details or comparisons.\n- "fill" (fill in the blank "______" with 4 options): if the passage centers on a key term, concept, name, or clear definition.\n- "why" (analytical "Why / How / What relationship" with 4 options): if the passage explains cause-and-effect or logical reasoning.\nDo NOT default to "mcq" automatically. NEVER choose "tf" (True/False) or 2 options. Always output 4 options.` + avoidNote + roundNote;
+    }
+    if (effectiveType === "tf") {
+      return `Required Format: True / False — write a clear declarative statement that is either true or subtly false based on the passage. The options array must have EXACTLY 2 items: ["True", "False"] (or their equivalent in the selected question language), with correctIndex 0 for True or 1 for False.`;
+    }
+    if (effectiveType === "fill") {
+      return `Required Format: Fill in the Blank — write a core sentence derived from the passage replacing the key term or concept with "______", and provide 4 short options to fill the blank (1 correct, 3 plausible distractors).`;
+    }
+    if (effectiveType === "why") {
+      return `Required Format: Analytical (Why / How / What relationship / What consequence) — write a question testing deeper causal or conceptual understanding with 4 analytical options (1 correct, 3 distractors).`;
+    }
+    return `Required Format: Standard Multiple Choice — write a clear question with 4 options (1 correct, 3 plausible distractors).`;
+  }
+  if (effectiveType === "mix") {
+    const avoidNote = avoidType
+      ? `\n\nتنبيه تنويع: كان السؤال السابق لهذه الفقرة من نمط «${avoidType}» — اختر هذه المرة نمطًا آخر غيره لتنويع التدريب، إلا إذا كانت طبيعة الفقرة لا تصلح إلا به.`
+      : "";
+    const roundNote = rt.length >= 2 && rt[0] && rt[0] === rt[1]
+      ? `\n\nتنبيه تنويع الجولة: كانت الأسئلة الأخيرة في هذه الجولة كلها من نمط «${rt[0]}» — إن سمحت طبيعة هذه الفقرة فاختر نمطًا مختلفًا عنه هذه المرة.`
+      : "";
+    return `نمط السؤال: «متنوع ذكي» — على خطوتين:\nالخطوة 1: حلّل طبيعة الفقرة المعطاة أولًا وحدّد أبرز سمتها: هل هي غنية بالمعلومات المتفرعة أو المقارنات؟ هل تتمحور حول مصطلح أو مفهوم أو اسم أو تعريف واضح؟ هل تشرح علاقات سبب ونتيجة أو تعليلًا منطقيًا؟\nالخطوة 2: اختر النمط الأنسب لطبيعتها من بين الأنماط الثلاثة وسجّل رمزه في حقل qType (أول حقل في JSON):\n- "mcq" (اختيار من متعدد بـ 4 خيارات): فقط إذا كانت الفقرة فعلًا غنية بالمعلومات المتفرعة أو المقارنات.\n- "fill" (أكمل الفراغ «______» بـ 4 خيارات): إذا كانت الفقرة تتمحور حول مصطلح علمي أو مفهوم محوري أو اسم أو تعريف واضح.\n- "why" (تحليلي استنتاجي «لماذا / كيف / ما العلاقة» بـ 4 خيارات): إذا كانت الفقرة تشرح علاقات سبب ونتيجة أو تعليلًا منطقيًا.\nتحذير مهم: لا تختر "mcq" تلقائيًا كخيار افتراضي؛ إن لم تكن الفقرة غنية بالمقارنات والمعلومات المتفرعة فاختر النمط الأنسب من غيره.\nممنوع منعًا باتًا اختيار نمط "صح أم خطأ" (tf) أو توليد سؤال بخيارين فقط — لا يندرج تحت هذا النمط إطلاقًا.\nحدّد qType أولًا قبل كتابة نص السؤال، ثم صُغ السؤال وفق النمط المختار والتزم الصارم بأربعة خيارات دائمًا.` + avoidNote + roundNote;
+  }
+  if (effectiveType === "tf") {
+    return `نمط السؤال المطلوب: صح أم خطأ — صغ عبارة خبرية واضحة ودقيقة تحتمل الصدق أو الكذب بناءً على الفقرة (نوّع بين العبارات الصحيحة والعبارات الخاطئة التي تتضمن تحريفًا ذكيًا لمعلومة في الفقرة). اجعل مصفوفة options تحتوي خيارين فقط بالضبط هما: ["صحيح", "خطأ"] (أو ما يقابلهما بلغة السؤال المختارة)، واجعل correctIndex يساوي 0 إذا كانت العبارة صحيحة أو 1 إذا كانت خاطئة.`;
+  }
+  if (effectiveType === "fill") {
+    return `نمط السؤال المطلوب: أكمل الفراغ — صغ جملة محورية مستخلصة من معنى الفقرة مع استبدال المصطلح أو المفهوم الجوهري برمز الفراغ «______»، واجعل الخيارات الأربعة (options) كلمات أو عبارات قصيرة تملأ هذا الفراغ (واحدة صحيحة وثلاثة مشتتات مقنعة).`;
+  }
+  if (effectiveType === "why") {
+    return `نمط السؤال المطلوب: سؤال تحليلي واستنتاجي (لماذا / كيف / ما العلاقة / ما النتيجة المترتبة) — صغ سؤالًا يختبر فهم العلاقات السببية أو الدلالية العميقة في الفقرة مع 4 خيارات تحليلية (خيار واحد صحيح وثلاثة مشتتات).`;
+  }
+  return `نمط السؤال المطلوب: اختيار من متعدد قياسي — صغ سؤالًا واضحًا مع 4 خيارات (خيار واحد صحيح وثلاثة مشتتات منطقية).`;
+}
+
+/* --- توليد سؤال من (سياق + فقرة [+ كلمة مفتاحية] [+ فكرة أساسية]) --- */
+async function aiGenerateQuestion({ context, paragraph, keyword, paragraphIndex = 0, avoidType = "", idea = "" }, signal) {
+  const lvl = getDifficulty();
+  const effectiveType = resolveEffectiveQType();
+  const deepIdea = String(idea || "").trim();
+  const isDeep = !!deepIdea;
+  const diffDirective = isEn()
+    ? (lvl === "easy"
+      ? "Difficulty: Easy — keep the question direct and clear, with distractors clearly distinct from the right answer."
+      : lvl === "hard"
+        ? "Difficulty: Hard — make the question analytical and nuanced, with closely plausible distractors requiring careful distinction."
+        : "")
+    : (lvl === "easy"
+      ? "مستوى الصعوبة المطلوب: سهل — اجعل السؤال مباشرًا وواضحًا، واجعل المشتتات مختلفة بوضوح عن الإجابة الصحيحة بحيث يستطيع قارئ متمكن من الفقرة الإجابة بسرعة وثقة."
+      : lvl === "hard"
+        ? "مستوى الصعوبة المطلوب: صعب — اجعل السؤال تحليليًا يتطلب فهمًا أعمق للفقرة لا مجرد استرجاع حرفي، واجعل المشتتات قريبة لفظيًا ودلاليًا من الإجابة الصحيحة بحيث يتطلب التفريق بينها تدقيقًا في التفاصيل."
+        : "");
+  const typeDirective = buildQuestionTypeDirective(effectiveType, avoidType, effectiveType === "mix" ? mixRoundTypes.slice(-2) : []);
+  const langDirective = buildLangDirective();
+  const extraDirective = buildExtraDirective();
+  const useKw = kwMode === "kw" && !!keyword;
+  const userContent = isEn()
+    ? `Overall Context:\n${context}\n\nPassage:\n"""\n${paragraph}\n"""` +
+      (isDeep
+        ? `\n\nCore idea to test in this question: "${deepIdea}"\nNote: Test ONLY this specific core idea; keep the question completely self-contained.`
+        : useKw
+          ? `\n\nTarget keyword to test: "${keyword}"`
+          : `\n\nFocus on the passage’s core idea without tying the question to one specific keyword.`) +
+      "\n\n" + typeDirective +
+      "\n\n" + getFormatsDirective() +
+      (diffDirective ? "\n\n" + diffDirective : "") +
+      (langDirective ? "\n\n" + langDirective : "") +
+      (extraDirective ? "\n\n" + extraDirective : "") +
+      `\n\nReturn the question as JSON.`
+    : `السياق العام للنص:\n${context}\n\nالفقرة:\n"""\n${paragraph}\n"""` +
+      (isDeep
+        ? `\n\nالفكرة الأساسية المطلوب اختبارها في هذا السؤال: «${deepIdea}»` +
+          `\nتنبيه: الفقرة قد تتضمن أفكارًا أساسية أخرى، لكن لكل فكرة سؤال مستقل خاص بها — فلا يجوز أن يتناول هذا السؤال إلا الفكرة المذكورة أعلاه وحدها، وأن يُصاغ ليفهم بمعزل عن بقية أفكار الفقرة.`
+        : useKw
+          ? `\n\nالكلمة المفتاحية المطلوب السؤال عنها: «${keyword}»`
+          : `\n\nمطلوب سؤال يركز على الفكرة المحورية للفقرة دون الارتباط بكلمة محددة.`) +
+      "\n\n" + typeDirective +
+      "\n\n" + getFormatsDirective() +
+      (diffDirective ? "\n\n" + diffDirective : "") +
+      (langDirective ? "\n\n" + langDirective : "") +
+      (extraDirective ? "\n\n" + extraDirective : "") +
+      `\n\nأعد السؤال بصيغة JSON.`;
+  const body = {
+    messages: [
+      { role: "system", content: isDeep ? (isEn() ? SYSTEM_QUIZ_DEEP_EN : SYSTEM_QUIZ_DEEP) : buildSystemQuiz(useKw) },
+      { role: "user", content: userContent },
+    ],
+    temperature: 0.85,
+    max_tokens: 2048,
+    jsonSchema: SCHEMA_QUESTION,
+  };
+  const { data } = await callGoogleAIStudioWithFallback({ body, signal, timeoutMs: 45000 });
+  const parsed = robustJSONParse(data.choices[0].message.content);
+  if (!parsed || typeof parsed.question !== "string" || !Array.isArray(parsed.options) || parsed.options.length < 2) {
+    throw new Error(t("err_parse_question"));
+  }
+  const nq = normalizeQuestion(parsed, effectiveType);
+  /* «متنوع ذكي»: احفظ النمط الذي اختاره النموذج لهذه الفقرة، وتابع أنماط الجولة الحالية لتنويعها */
+  if (effectiveType === "mix") {
+    if (Number.isInteger(paragraphIndex)) mixTypeHistory.set(paragraphIndex, nq.qType);
+    mixRoundTypes.push(nq.qType);
+  }
+  return nq;
+}
+
+function normalizeQuestion(q, effectiveType = "mcq") {
+  let rawOpts = q.options.map((o) => String(o).trim()).filter(Boolean);
+  /* «متنوع ذكي»: النمط الفعلي هو ما اختاره النموذج في qType — ولا يُقبل "tf" أبدًا في هذا النمط */
+  const resolvedType = (effectiveType === "mix" && ["mcq", "fill", "why"].includes(q.qType))
+    ? q.qType
+    : (effectiveType === "mix" ? "mcq" : effectiveType);
+  const isTF = effectiveType !== "mix" && (resolvedType === "tf" || rawOpts.length === 2);
+  let options = isTF ? rawOpts.slice(0, 2) : rawOpts.slice(0, 4);
+  if (!isTF) {
+    while (options.length < 4) options.push(t("opt_none_above", { n: options.length + 1 }));
+  }
+  let correctIndex = Number.isInteger(q.correctIndex) ? q.correctIndex : parseInt(q.correctIndex, 10);
+  if (!Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex >= options.length) correctIndex = 0;
+  const correctText = options[correctIndex];
+  if (!isTF) {
+    options = shuffle([...options]);
+  }
+  return {
+    qType: isTF ? "tf" : resolvedType,
+    question: String(q.question).trim(),
+    options,
+    correctIndex: options.indexOf(correctText),
+    explanation: String(q.explanation || "").trim(),
+  };
+}
+
+/* --- استخراج كلمات مفتاحية جديدة --- */
+async function aiRefreshKeywords({ paragraph, exclude }, signal) {
+  const body = {
+    messages: [
+      { role: "system", content: isEn() ? "You extract keywords from text passages. Return JSON only." : "أنت مساعد يستخرج كلمات مفتاحية من النصوص. أعد JSON فقط." },
+      {
+        role: "user",
+        content: isEn()
+          ? `Passage:\n"""\n${paragraph}\n"""\n\nPreviously used keywords (do not repeat): ${exclude.join(", ") || "None"}\n\nExtract 3 new keywords appearing verbatim in the passage that are not in the excluded list.`
+          : `الفقرة:\n"""\n${paragraph}\n"""\n\nكلمات استُخدمت سابقًا (ممنوع تكرارها): ${exclude.join("، ") || "لا شيء"}\n\nاستخرج 3 كلمات مفتاحية جديدة وردت حرفيًا في الفقرة وليست ضمن القائمة الممنوعة.`,
+      },
+    ],
+    temperature: 0.8,
+    max_tokens: 512,
+    jsonSchema: {
+      type: "OBJECT",
+      properties: { keywords: { type: "ARRAY", items: { type: "STRING" } } },
+      required: ["keywords"],
+    },
+  };
+  try {
+    const { data } = await callGoogleAIStudioWithFallback({ body, signal, timeoutMs: 30000 });
+    const parsed = robustJSONParse(data.choices[0].message.content);
+    const kws = parsed && Array.isArray(parsed.keywords)
+      ? parsed.keywords.map((k) => String(k).trim()).filter(Boolean)
+      : [];
+    return [...new Set(kws)].slice(0, 3);
+  } catch {
+    return [];
+  }
+}
+
+/* --- رسائل أخطاء مفهومة بالعربية --- */
+function friendlyApiError(err) {
+  const msg = String((err && err.message) || err || "");
+  if (/API key not valid|API_KEY_INVALID/i.test(msg)) return t("err_invalid_key");
+  if (/\b401\b|\b403\b|permission|PERMISSION_DENIED/i.test(msg)) return t("err_403");
+  if (/\b429\b|quota|RESOURCE_EXHAUSTED/i.test(msg)) return t("err_429");
+  if (/\b404\b|not found|NOT_FOUND/i.test(msg)) return t("err_404");
+  if (/abort|timeout/i.test(msg)) return t("err_timeout");
+  if (/failed to fetch|networkerror|load failed/i.test(msg)) return t("err_network");
+  if (/مفتاح Google AI Studio API غير مُعرَّف|API key is not set/i.test(msg)) return t("err_enter_key");
+  return msg || t("err_unexpected");
+}
+
+/* =========================================================
+   3) أدوات الكلمات المفتاحية المحلية
+   ========================================================= */
+
+const AR_STOPWORDS = new Set(
+  ("في من على إلى عن أن إن أنه إنه التي الذي الذين اللواتي هذا هذه ذلك تلك هو هي هم هن نحن كان كانت يكون تكون " +
+    "قد لقد مع كل بعض لا ما لم لن إذا ثم أو أم بل بين عند عندما كما لكن لكنه حيث بعد قبل خلال نحو منذ سوف يا أما " +
+    "إما كي لكي لأن حتى غير أي أيضا أيضًا هناك هنا به بها بهم بها له لها لهم منه منها عليه عليها إليه إليها ذات ذو " +
+    "عدد عدة شيء أشياء جدا جدًا يمكن يجب أكثر أقل كثير قليل أول آخر بينما رغم مثل نفس عبر دون بدون سواء وذلك وهذه " +
+    "التي وهو وهي وكان وقد ولكنه هذا تلك هناك أثناء ضمن سوى عوض بد إذ حين لحظ إلا سوى كأن ليس ليست لست لم يكن").split(/\s+/)
+);
+
+function localExtractKeywords(text, exclude) {
+  const ex = exclude || [];
+  const words = String(text)
+    .replace(/[^\u0600-\u06FF0-9A-Za-z\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  const freq = new Map();
+  for (const w of words) {
+    if (w.length < 3 || AR_STOPWORDS.has(w) || EN_STOPWORDS.has(w.toLowerCase()) || ex.includes(w)) continue;
+    freq.set(w, (freq.get(w) || 0) + 1);
+  }
+  let cands = [...freq.entries()]
+    .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
+    .map((e) => e[0]);
+  if (!cands.length) {
+    cands = words.filter((w) => w.length >= 3 && !ex.includes(w)).sort((a, b) => b.length - a.length);
+  }
+  return [...new Set(cands)].slice(0, 3);
+}
+
+/* =========================================================
+   4) أدوات مساعدة عامة + المؤثرات الصوتية + القراءة الصوتية (TTS)
+   ========================================================= */
+
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isAbort(err) {
+  return err && (err.name === "AbortError" || /الطلب مُلغى خارجيًا|Request was cancelled/i.test(String(err.message)));
+}
+
+function fmtDuration(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function el(id) {
+  return document.getElementById(id);
+}
+
+function quizCountWord(n) {
+  if (isEn()) return n === 1 ? "1 question" : n + " questions";
+  if (n === 1) return "سؤال واحد";
+  if (n === 2) return "سؤالان";
+  if (n >= 3 && n <= 10) return n + " أسئلة";
+  return n + " سؤالًا";
+}
+
+function paraCountWord(n) {
+  if (isEn()) return n === 1 ? "1 passage" : n + " passages";
+  if (n === 1) return "فقرة واحدة";
+  if (n === 2) return "فقرتان";
+  if (n >= 3 && n <= 10) return n + " فقرات";
+  return n + " فقرة";
+}
+
+function testCountWord(n) {
+  if (isEn()) return n === 1 ? "1 quiz" : n + " quizzes";
+  if (n === 1) return "اختبار واحد";
+  if (n === 2) return "اختباران";
+  if (n >= 3 && n <= 10) return n + " اختبارات";
+  return n + " اختبارًا";
+}
+
+function playCountWord(n) {
+  if (isEn()) return n === 1 ? "Played once" : "Played " + n + " times";
+  if (n === 1) return "لُعب مرة واحدة";
+  if (n === 2) return "لُعب مرتين";
+  return "لُعب " + n + " مرات";
+}
+
+function escHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ====== النطق الصوتي (Text-to-Speech) ====== */
+const LANG_BCP47 = {
+  auto: "ar-SA",
+  ar: "ar-SA",
+  en: "en-US",
+  fr: "fr-FR",
+  es: "es-ES",
+  de: "de-DE",
+  tr: "tr-TR",
+  ur: "ur-PK",
+  id: "id-ID",
+  ru: "ru-RU",
+  zh: "zh-CN",
+};
+
+function stopSpeech() {
+  try {
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  } catch {}
+  const btn = el("btn-tts-q");
+  if (btn) btn.classList.remove("speaking");
+}
+
+function speakText(text, triggerBtn) {
+  if (!("speechSynthesis" in window)) {
+    toast("error", t("toast_tts_unsupported"));
+    return;
+  }
+  if (window.speechSynthesis.speaking) {
+    stopSpeech();
+    return;
+  }
+  const clean = String(text || "").trim();
+  if (!clean) return;
+  const utter = new SpeechSynthesisUtterance(clean);
+  const isLatin = /[A-Za-z]{4,}/.test(clean) && !/[\u0600-\u06FF]{3,}/.test(clean);
+  utter.lang = isLatin && quizLang === "auto" ? "en-US" : (LANG_BCP47[quizLang] || "ar-SA");
+  utter.rate = 0.96;
+  if (triggerBtn) triggerBtn.classList.add("speaking");
+  utter.onend = () => { if (triggerBtn) triggerBtn.classList.remove("speaking"); };
+  utter.onerror = () => { if (triggerBtn) triggerBtn.classList.remove("speaking"); };
+  window.speechSynthesis.speak(utter);
+}
+
+function speakCurrentQuestion() {
+  const q = state.rendered;
+  if (!q) return;
+  /* نقرأ النص دون علامات Markdown ودون محددات الرياضيات حتى لا تُقرأ العلامات بصوت عالٍ */
+  const text = stripMathDelimiters(stripMdForSpeech(q.question)) + t("tts_options_prefix") + q.options.map((o, i) => t("tts_option_item", { n: i + 1, text: stripMathDelimiters(stripMdForSpeech(o)) })).join(" . ");
+  speakText(text, el("btn-tts-q"));
+}
+
+/* ====== المؤثرات الصوتية (WebAudio) ====== */
+const sound = { enabled: store.get("quiz_sound") !== "off", ctx: null };
+
+function audioCtx() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  if (!sound.ctx) sound.ctx = new AC();
+  if (sound.ctx.state === "suspended") sound.ctx.resume().catch(() => {});
+  return sound.ctx;
+}
+
+function tone(freq, start, dur, type) {
+  const ctx = audioCtx();
+  if (!ctx) return;
+  const o = ctx.createOscillator();
+  const g = ctx.createGain();
+  o.type = type || "sine";
+  o.frequency.value = freq;
+  const t = ctx.currentTime + start;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.06, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g);
+  g.connect(ctx.destination);
+  o.start(t);
+  o.stop(t + dur + 0.05);
+}
+
+function playCorrect() {
+  if (!sound.enabled) return;
+  try { tone(587.33, 0, 0.12); tone(880, 0.1, 0.18); } catch {}
+}
+
+function playWrong() {
+  if (!sound.enabled) return;
+  try { tone(311.13, 0, 0.16, "triangle"); tone(233.08, 0.12, 0.22, "triangle"); } catch {}
+}
+
+function playFinish() {
+  if (!sound.enabled) return;
+  try { [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.11, 0.16)); } catch {}
+}
+
+function updateSoundIcon() {
+  el("icon-vol").classList.toggle("hidden", !sound.enabled);
+  el("icon-vol-x").classList.toggle("hidden", sound.enabled);
+  el("btn-sound").setAttribute("aria-pressed", String(sound.enabled));
+}
+
+function toggleSound() {
+  sound.enabled = !sound.enabled;
+  store.set("quiz_sound", sound.enabled ? "on" : "off");
+  updateSoundIcon();
+  if (sound.enabled) playCorrect();
+  toast("info", sound.enabled ? t("toast_sound_on") : t("toast_sound_off"));
+}
+
+/* ====== إعدادات وضع السرعة ====== */
+const speedSettings = { on: false, secs: 60 }; /* الزمن الافتراضي 60 ثانية بطلب المستخدم */
+
+function clampQuestionSecs(n) {
+  const v = parseInt(n, 10);
+  if (!Number.isFinite(v)) return 60;
+  return Math.max(1, Math.min(600, v));
+}
+
+function loadSpeedSettings() {
+  try {
+    const raw = JSON.parse(store.get("quiz_speed") || "null");
+    if (raw && typeof raw.on === "boolean") {
+      speedSettings.on = raw.on;
+      speedSettings.secs = clampQuestionSecs(raw.secs);
+    }
+  } catch {}
+}
+
+function saveSpeedSettings() {
+  store.set("quiz_speed", JSON.stringify({ on: speedSettings.on, secs: speedSettings.secs }));
+}
+
+function syncSpeedInputs() {
+  el("speed-mode").checked = speedSettings.on;
+  el("speed-seconds").value = String(speedSettings.secs);
+}
+
+/* ====== مستوى الصعوبة ====== */
+const DIFF_KEYS = new Set(["easy", "medium", "hard"]);
+function getDiffLabel(lvl) { return t("diff_" + (lvl || "medium")); }
+const DIFF_LABELS = new Proxy({}, { get: (_, k) => DIFF_KEYS.has(k) ? getDiffLabel(k) : undefined });
+const DIFF_ORDER = ["easy", "medium", "hard"];
+let difficulty = "medium";
+
+function loadDifficulty() {
+  const v = store.get("quiz_difficulty");
+  difficulty = DIFF_LABELS[v] ? v : "medium";
+}
+
+function getDifficulty() { return difficulty; }
+
+function syncDifficultyUI() {
+  const seg = el("difficulty-seg");
+  if (!seg) return;
+  const idx = DIFF_ORDER.indexOf(difficulty);
+  seg.querySelectorAll(".seg-btn").forEach((b) => {
+    const on = b.dataset.level === difficulty;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-checked", on ? "true" : "false");
+  });
+  seg.dataset.diff = difficulty;
+  const thumb = seg.querySelector(".seg-thumb");
+  if (thumb) thumb.style.transform = "translateX(" + ((document.documentElement.dir === "ltr" ? 1 : -1) * 100 * idx) + "%)";
+}
+
+function setDifficulty(lvl, silent) {
+  if (!DIFF_LABELS[lvl]) return;
+  difficulty = lvl;
+  store.set("quiz_difficulty", lvl);
+  syncDifficultyUI();
+  if (!silent) {
+    toast("info", lvl === "easy"
+      ? t("toast_diff_easy", { label: getDiffLabel(lvl) })
+      : lvl === "hard"
+        ? t("toast_diff_hard", { label: getDiffLabel(lvl) })
+        : t("toast_diff_med", { label: getDiffLabel(lvl) }));
+  }
+}
+
+/* ====== لغة السؤال ====== */
+const LANG_NAMES_EN = {
+  auto: "Auto", ar: "Arabic", en: "English", fr: "French", es: "Spanish",
+  de: "German", tr: "Turkish", ur: "Urdu", id: "Indonesian", ru: "Russian", zh: "Chinese",
+};
+function getLangName(v) { return t("lang_" + (v || "auto")); }
+const LANG_NAMES = new Proxy({}, { get: (_, k) => Object.prototype.hasOwnProperty.call(LANG_NAMES_EN, k) ? getLangName(k) : undefined });
+let quizLang = "auto";
+
+function loadQuizLang() {
+  const v = store.get("quiz_lang");
+  quizLang = LANG_NAMES[v] ? v : "auto";
+}
+
+function getQuizLang() { return quizLang; }
+
+function syncQuizLangUI() {
+  el("quiz-lang").value = quizLang;
+}
+
+function setQuizLang(v, silent) {
+  if (!LANG_NAMES[v]) return;
+  quizLang = v;
+  store.set("quiz_lang", v);
+  syncQuizLangUI();
+  if (!silent) {
+    toast("info", v === "auto" ? t("toast_quiz_lang_auto") : t("toast_quiz_lang_set", { label: getLangName(v) }));
+  }
+}
+
+function buildLangDirective() {
+  if (quizLang === "auto" || !LANG_NAMES_EN[quizLang]) return "";
+  if (isEn()) {
+    return "Important — Question Language: Write the question, all options, and the explanation in " + LANG_NAMES_EN[quizLang] +
+      ". If the passage or keyword is in another language, translate accurately without altering meaning, and optionally include the original term in parentheses on first mention.";
+  }
+  return "مهم — لغة السؤال: اكتب السؤال والخيارات والتعليل كلها باللغة " + getLangName(quizLang) +
+    ". وإذا كانت الفقرة أو الكلمة المفتاحية بلغة أخرى فترجم المعنى بدقة دون تغيير المضمون، ويُستحسن إثبات الكلمة المفتاحية الأصلية بين قوسين عند أول ذكر لها.";
+}
+
+/* ====== أسلوب توليد الأسئلة + خلط ترتيب الفقرات ====== */
+const KW_MODE_KEYS = new Set(["kw", "none", "deep"]);
+function getKwModeLabel(v) { return t("kw_mode_" + (v || "deep")); }
+const KW_MODE_LABELS = new Proxy({}, { get: (_, k) => KW_MODE_KEYS.has(k) ? getKwModeLabel(k) : undefined });
+let kwMode = "deep"; /* الافتراضي: «الاختبار المعمق» بطلب المستخدم */
+let shuffleParagraphsOn = false;
+
+function loadKwMode() {
+  const v = store.get("quiz_kw_mode");
+  /* الافتراضي «الاختبار المعمق» — ما لم يختر المستخدم صراحةً غيره (يُحفظ الاختيار الصريح ولا يُهجر) */
+  kwMode = (v === "kw" || v === "none") ? v : "deep";
+  shuffleParagraphsOn = store.get("quiz_shuffle_paras") === "1";
+}
+
+function getKwMode() { return kwMode; }
+
+function syncKwModeUI() {
+  el("kw-mode").value = kwMode;
+  const sp = el("shuffle-paragraphs");
+  if (sp) sp.checked = shuffleParagraphsOn;
+  const hint = el("start-hint");
+  if (hint) hint.textContent = kwMode === "deep" ? t("start_hint_deep") : t("start_hint_default");
+}
+
+function setKwMode(v, silent) {
+  if (v !== "kw" && v !== "none" && v !== "deep") return;
+  const prev = kwMode;
+  kwMode = v;
+  store.set("quiz_kw_mode", v);
+  syncKwModeUI();
+  if (!silent) {
+    let msg = t("toast_kw_mode", { label: getKwModeLabel(v) });
+    if (v === "deep" && prev !== "deep" && state && state.analysis && Array.isArray(state.analysis.paragraphs) &&
+        state.analysis.paragraphs.length && !state.analysis.paragraphs.some((p) => Array.isArray(p.ideas) && p.ideas.length)) {
+      msg += t("toast_kw_mode_deep_note");
+    }
+    toast("info", msg);
+  }
+}
+
+/* ====== تعليمات إضافية من المستخدم ====== */
+const MAX_EXTRA_INSTRUCTIONS = 500;
+let extraInstructions = "";
+
+function loadExtraInstructions() {
+  extraInstructions = String(store.get("quiz_extra_instructions") || "").slice(0, MAX_EXTRA_INSTRUCTIONS);
+}
+
+function getExtraInstructions() { return extraInstructions; }
+
+function updateExtraCount(live) {
+  const n = typeof live === "string" ? live.length : extraInstructions.length;
+  el("extra-count").textContent = n + "/" + MAX_EXTRA_INSTRUCTIONS;
+  el("btn-extra-clear").disabled = n === 0;
+  el("extra-instructions-box").classList.toggle("has-content", n > 0);
+}
+
+function syncExtraInstructionsUI() {
+  el("extra-instructions").value = extraInstructions;
+  updateExtraCount();
+}
+
+function setExtraInstructions(v, silent) {
+  const clean = String(v || "").replace(/\r/g, "").slice(0, MAX_EXTRA_INSTRUCTIONS);
+  extraInstructions = clean;
+  store.set("quiz_extra_instructions", clean);
+  updateExtraCount();
+  if (!silent) {
+    toast("info", clean ? t("toast_extra_saved") : t("toast_extra_cleared"));
+  }
+}
+
+let extraSavedTimer = null;
+function flashExtraSaved() {
+  const badge = el("extra-saved");
+  badge.classList.add("show");
+  clearTimeout(extraSavedTimer);
+  extraSavedTimer = setTimeout(() => badge.classList.remove("show"), 1600);
+}
+
+function buildExtraDirective() {
+  const t = extraInstructions.trim();
+  if (!t) return "";
+  return (isEn() ? "User extra instructions — follow these when writing the question, options, and explanation unless they conflict with the rules above:\n" : "تعليمات إضافية من المستخدم — التزم بها في صياغة السؤال وخياراته وتعليله ما أمكن، ما لم تتعارض مع القواعد أعلاه:\n") + t;
+}
+
+/* ====== نظام الأوسمة والإنجازات (Achievements) ====== */
+const ACHIEVEMENTS_KEY = "quiz_achievements_v1";
+const ACHIEVEMENTS_DEF = [
+  { id: "first_quiz", icon: "🚀" },
+  { id: "perfect_score", icon: "🏆" },
+  { id: "streak_5", icon: "🔥" },
+  { id: "speed_master", icon: "⚡" },
+  { id: "deep_reader", icon: "📖" },
+  { id: "hard_winner", icon: "🛡️" },
+  { id: "mistake_crusher", icon: "🎯" },
+  { id: "veteran_10", icon: "👑" },
+];
+function achTitle(a) { return t("ach_" + a.id + "_title"); }
+function achDesc(a) { return t("ach_" + a.id + "_desc"); }
+
+function loadAchievements() {
+  try { return JSON.parse(store.get(ACHIEVEMENTS_KEY) || "{}"); } catch { return {}; }
+}
+
+function saveAchievements(map) {
+  store.set(ACHIEVEMENTS_KEY, JSON.stringify(map || {}));
+}
+
+function evaluateAchievements({ pct, total, bestStreak, speedBonus, passagesViewed, isFocus, lvl, historyCount }) {
+  const unlocked = loadAchievements();
+  const newlyUnlocked = [];
+  const unlock = (id) => {
+    if (!unlocked[id]) {
+      unlocked[id] = Date.now();
+      const def = ACHIEVEMENTS_DEF.find((a) => a.id === id);
+      if (def) newlyUnlocked.push(def);
+    }
+  };
+  unlock("first_quiz");
+  if (pct === 100 && total >= 3) unlock("perfect_score");
+  if (bestStreak >= 5) unlock("streak_5");
+  if (speedBonus >= 3) unlock("speed_master");
+  if (passagesViewed >= 3) unlock("deep_reader");
+  if (lvl === "hard" && pct >= 80 && total >= 2) unlock("hard_winner");
+  if (isFocus && pct === 100) unlock("mistake_crusher");
+  if (historyCount >= 10) unlock("veteran_10");
+
+  if (newlyUnlocked.length) {
+    saveAchievements(unlocked);
+    newlyUnlocked.forEach((b, idx) => {
+      setTimeout(() => {
+        toast("success", t("toast_badge_unlocked", { icon: b.icon, title: achTitle(b), desc: achDesc(b) }));
+      }, idx * 700);
+    });
+  }
+}
+
+function renderAchievementsStrip() {
+  const wrap = el("achievements-strip");
+  if (!wrap) return;
+  const unlocked = loadAchievements();
+  wrap.innerHTML = "";
+  ACHIEVEMENTS_DEF.forEach((a) => {
+    const isOn = !!unlocked[a.id];
+    const span = document.createElement("span");
+    span.className = "ach-badge" + (isOn ? " unlocked" : "");
+    span.title = achTitle(a) + " — " + achDesc(a) + (isOn ? t("badge_unlocked_suffix") : t("badge_locked_suffix"));
+    span.textContent = `${a.icon} ${a.title}`;
+    wrap.appendChild(span);
+  });
+}
+
+/* ====== سجل النتائج (localStorage) ====== */
+function loadHistory() {
+  try { return JSON.parse(store.get("quiz_history") || "[]"); } catch { return []; }
+}
+
+function saveHistoryItem(item) {
+  const h = loadHistory();
+  h.unshift(item);
+  store.set("quiz_history", JSON.stringify(h.slice(0, 20)));
+}
+
+function clearHistory() {
+  if (!loadHistory().length) return;
+  if (!confirm(t("confirm_clear_history"))) return;
+  store.del("quiz_history");
+  renderHistory();
+  toast("info", t("toast_history_cleared"));
+}
+
+function exportHistoryCSV() {
+  const h = loadHistory();
+  if (!h.length) {
+    toast("error", t("toast_no_history_export"));
+    return;
+  }
+  const esc = (v) => {
+    const s = String(v == null ? "" : v);
+    return /[",\n;]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const typeOf = (x) =>
+    [x.focus && t("tag_focus"), x.imported && t("tag_imported")].filter(Boolean).join("+") || t("tag_normal");
+  const rows = [
+    t("csv_headers"),
+  ];
+  h.forEach((x) => {
+    rows.push([
+      new Date(x.date).toLocaleString(getUiLocale()),
+      x.score,
+      x.total,
+      x.pct,
+      Math.round((x.duration || 0) / 1000),
+      getDiffLabel(x.lvl || "medium"),
+      typeOf(x),
+      String(x.preview || "").replace(/\s+/g, " ").slice(0, 60),
+    ]);
+  });
+  const csv = "\uFEFF" + rows.map((r) => r.map(esc).join(",")).join("\r\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = t("csv_filename_prefix") + new Date().toISOString().slice(0, 10) + ".csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  toast("success", t("toast_history_exported"));
+}
+
+let histRange = "all";
+
+function historyInRange(all) {
+  if (histRange === "all") return all;
+  const days = parseInt(histRange, 10) || 0;
+  if (!days) return all;
+  const min = Date.now() - days * 86400000;
+  return all.filter((x) => {
+    const t = new Date(x.date).getTime();
+    return !isNaN(t) && t >= min;
+  });
+}
+
+function setHistoryRange(range) {
+  histRange = range;
+  document.querySelectorAll(".hist-range").forEach((b) => {
+    const on = b.dataset.range === histRange;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+  renderHistory();
+}
+
+/* testCountWord defined above */
+
+function renderWeekStrip(all) {
+  const strip = el("week-strip");
+  if (!strip) return;
+  strip.innerHTML = "";
+  const day = 86400000;
+  const now = Date.now();
+  const inWin = (x, from, to) => {
+    const t = new Date(x.date).getTime();
+    return !isNaN(t) && t >= from && t < to;
+  };
+  const tw = all.filter((x) => inWin(x, now - 7 * day, now + day));
+  const lw = all.filter((x) => inWin(x, now - 14 * day, now - 7 * day));
+  if (!tw.length && !lw.length) { strip.classList.add("hidden"); return; }
+  strip.classList.remove("hidden");
+
+  const avgOf = (arr) => arr.length ? Math.round(arr.reduce((s, x) => s + (x.pct || 0), 0) / arr.length) : null;
+  const twAvg = avgOf(tw);
+  const lwAvg = avgOf(lw);
+
+  const seg = (label, count, avg, dim) => {
+    const d = document.createElement("div");
+    d.className = "week-seg" + (dim ? " dim" : "");
+    const l = document.createElement("span");
+    l.className = "week-label";
+    l.textContent = label;
+    const v = document.createElement("strong");
+    v.className = "week-value";
+    v.textContent = count ? testCountWord(count) + (avg !== null ? t("week_avg", { avg }) : "") : t("week_no_tests");
+    d.appendChild(l);
+    d.appendChild(v);
+    return d;
+  };
+
+  strip.appendChild(seg(t("week_this"), tw.length, twAvg, false));
+  strip.appendChild(seg(t("week_last"), lw.length, lwAvg, !lw.length));
+
+  const delta = document.createElement("span");
+  delta.className = "week-delta";
+  if (twAvg !== null && lwAvg !== null) {
+    const diff = twAvg - lwAvg;
+    if (diff > 0) { delta.classList.add("up"); delta.textContent = "↑ +" + diff + "%"; }
+    else if (diff < 0) { delta.classList.add("down"); delta.textContent = "↓ " + diff + "%"; }
+    else { delta.classList.add("flat"); delta.textContent = t("week_flat"); }
+  } else {
+    delta.classList.add("flat");
+    delta.textContent = twAvg !== null ? t("week_start") : "—";
+  }
+  strip.appendChild(delta);
+}
+
+function renderHistory() {
+  const card = el("history-card");
+  const list = el("history-list");
+  const spark = el("history-spark");
+  const all = loadHistory();
+  if (!all.length) {
+    card.classList.add("hidden");
+    list.innerHTML = "";
+    spark.innerHTML = "";
+    return;
+  }
+  card.classList.remove("hidden");
+
+  renderAchievementsStrip();
+
+  const h = historyInRange(all);
+  const best = h.length ? Math.max.apply(null, h.map((x) => x.pct || 0)) : 0;
+
+  renderWeekStrip(all);
+
+  const noData = !h.length;
+  const avg = noData ? 0 : Math.round(h.reduce((s, x) => s + (x.pct || 0), 0) / h.length);
+  el("hs-count").textContent = String(h.length);
+  el("hs-avg").textContent = noData ? "—" : avg + "%";
+  el("hs-best").textContent = noData ? "—" : best + "%";
+  const trendBox = el("hs-trend-box");
+  trendBox.classList.remove("trend-up", "trend-down");
+  const trendEl = el("hs-trend");
+  const lastPct = h[0] ? (h[0].pct || 0) : 0;
+  const prevPct = h[1] ? (h[1].pct || 0) : null;
+  if (noData || prevPct === null) trendEl.textContent = "—";
+  else if (lastPct > prevPct) { trendEl.textContent = "↑ " + lastPct + "%"; trendBox.classList.add("trend-up"); }
+  else if (lastPct < prevPct) { trendEl.textContent = "↓ " + lastPct + "%"; trendBox.classList.add("trend-down"); }
+  else trendEl.textContent = "→ " + lastPct + "%";
+
+  spark.innerHTML = "";
+  list.innerHTML = "";
+  if (noData) {
+    const empty = document.createElement("div");
+    empty.className = "spark-empty";
+    empty.textContent = t("hist_empty_range");
+    spark.appendChild(empty);
+    return;
+  }
+
+  h.slice(0, 12).reverse().forEach((item) => {
+    const bar = document.createElement("i");
+    bar.className = "bar" + (h.length > 1 && (item.pct || 0) === best ? " best" : "");
+    bar.style.height = Math.max(8, item.pct || 4) + "%";
+    let tip = (item.score || 0) + "/" + (item.total || 0) + " — " + (item.pct || 0) + "%";
+    if (item.focus) tip += " (" + t("tag_focus") + ")";
+    if (item.imported) tip += " (" + t("tag_imported") + ")";
+    bar.title = tip;
+    spark.appendChild(bar);
+  });
+
+  h.slice(0, 10).forEach((item) => {
+    const li = document.createElement("li");
+    li.className = "history-item";
+
+    const score = document.createElement("span");
+    score.className = "history-score";
+    score.textContent = item.score + "/" + item.total;
+
+    const pct = document.createElement("span");
+    pct.className = "history-pct";
+    pct.textContent = (item.pct || 0) + "%";
+
+    const preview = document.createElement("span");
+    preview.className = "history-preview";
+    preview.textContent = item.preview || "";
+
+    const date = document.createElement("span");
+    date.className = "history-date";
+    try {
+      date.textContent = new Date(item.date).toLocaleString(getUiLocale(), { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+    } catch { date.textContent = ""; }
+
+    li.appendChild(score);
+    li.appendChild(pct);
+    if (item.focus) {
+      const d = document.createElement("span");
+      d.className = "chip history-chip-mini focus";
+      d.textContent = t("tag_focus");
+      li.appendChild(d);
+    }
+    if (item.imported) {
+      const d = document.createElement("span");
+      d.className = "chip history-chip-mini imported";
+      d.textContent = t("tag_imported");
+      li.appendChild(d);
+    }
+    if (item.lvl && item.lvl !== "medium") {
+      const lv = document.createElement("span");
+      lv.className = "chip history-chip-mini lvl-chip " + (item.lvl === "hard" ? "bad" : "ok");
+      lv.textContent = getDiffLabel(item.lvl) || "";
+      li.appendChild(lv);
+    }
+    if ((item.pct || 0) === best && h.length > 1) {
+      const b = document.createElement("span");
+      b.className = "history-best";
+      b.textContent = t("tag_best");
+      li.appendChild(b);
+    }
+    li.appendChild(date);
+    list.appendChild(li);
+  });
+}
+
+/* ====== احتفال النتيجة العالية ====== */
+function burstConfetti() {
+  if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const wrap = el("confetti");
+  wrap.innerHTML = "";
+  const colors = ["#14b8a6", "#34d399", "#f59e0b", "#fb7185", "#a3e635"];
+  for (let i = 0; i < 42; i++) {
+    const p = document.createElement("i");
+    p.style.left = Math.random() * 100 + "%";
+    p.style.background = colors[i % colors.length];
+    p.style.width = 6 + Math.random() * 6 + "px";
+    p.style.height = 10 + Math.random() * 8 + "px";
+    p.style.setProperty("--d", 2.2 + Math.random() * 1.6 + "s");
+    p.style.setProperty("--delay", Math.random() * 0.5 + "s");
+    p.style.setProperty("--r", Math.floor(Math.random() * 360) + "deg");
+    wrap.appendChild(p);
+  }
+  setTimeout(() => { wrap.innerHTML = ""; }, 4800);
+}
+
+function showScreen(name) {
+  stopSpeech();
+  ["setup", "preparing", "quiz", "results", "cards", "lists"].forEach((s) => {
+    const node = el("screen-" + s);
+    if (node) node.classList.toggle("active", s === name);
+  });
+  updateHeaderStudyBtn();
+  updateBrandBtn();
+  window.scrollTo(0, 0);
+  /* خطة ب: عند إنهاء اختبار (شاشة النتائج) حدّث جدولة الإشعارات فورًا —
+     إن لم يبقَ شيء للاستئناف تُلغى الإشعارات المجدولة كي لا تصل بلا داعٍ */
+  if (name === "results") { syncPushSchedule(); syncReminderTriggers(); }
+}
+
+function activeScreenName() {
+  const active = document.querySelector(".screen.active");
+  return active ? active.id.replace("screen-", "") : "setup";
+}
+
+/* شارة الموقع (النجمة + الاسم): زر عودة للرئيسية خارج شاشة الإعداد — معطّل عليها */
+function updateBrandBtn() {
+  const b = el("brand-home");
+  if (!b) return;
+  const onHome = activeScreenName() === "setup";
+  b.disabled = onHome;
+  b.title = onHome ? "" : t("brand_home_title");
+}
+
+function goHomeFromBrand() {
+  const name = activeScreenName();
+  if (name === "setup") return;
+  if (name === "preparing") {
+    /* تحضير جارٍ — تأكيد قبل إلغاء التحليل */
+    if (!confirm(t("confirm_cancel_prep"))) return;
+    if (state.abortCtrl) { try { state.abortCtrl.abort(); } catch {} }
+    stopPreparingAnimation();
+    showScreen("setup");
+    toast("info", t("toast_prep_cancelled"));
+    return;
+  }
+  if (name === "quiz") {
+    /* داخل اختبار — quitQuiz يؤكد ويحفظ التقدم للاستئناف */
+    quitQuiz();
+    return;
+  }
+  /* النتائج / البطاقات / القوائم: لا يضيع شيء — عودة مباشرة */
+  showScreen("setup");
+}
+
+function updateHeaderStudyBtn() {
+  const btn = el("btn-header-study");
+  if (!btn) return;
+  const hasAnalysis = !!(state.analysis && Array.isArray(state.analysis.paragraphs) && state.analysis.paragraphs.length);
+  const lastSess = loadLastSession();
+  btn.classList.toggle("hidden", !hasAnalysis && !lastSess);
+}
+
+/* =========================================================
+   5) حالة التطبيق
+   ========================================================= */
+
+const state = {
+  analysis: null,          /* { context, paragraphs: [{text, keywords, ideas}] } */
+  activeParagraphs: [],    /* مدخلات الاختبار: فقرة لكل سؤال — وفي «الاختبار المعمق» مدخل لكل فكرة أساسية */
+  usedKeywords: [],        /* لكل فقرة: الكلمات المستخدمة في الجولات السابقة */
+  round: 0,
+  roundPcts: [],           /* نسب كل جولة على نفس النص (للمقارنة) */
+  quiz: null,              /* { current, score, streak, bestStreak, answers, startedAt, timerId, ... } */
+  pending: new Map(),      /* فهرس الفقرة ← وعد بتوليد السؤال */
+  questions: new Map(),    /* فهرس الفقرة ← السؤال المولّد نفسه */
+  abortCtrl: null,
+  rendered: null,          /* السؤال المعروض حاليًا */
+  regen: null,             /* { i, q } سؤال معاد توليده للفقرة i */
+  staticQuestions: null,   /* أسئلة ثابتة مستوردة من ملف JSON */
+  focusRestore: null,      /* لقطة لاستعادة الاختبار الكامل بعد جولة التدريب على الأخطاء */
+  importMeta: null,        /* { name } للاختبار المستورد */
+  savedRef: null,          /* { listId, itemId } */
+};
+
+/* =========================================================
+   6) تحضير الاختبار (شاشة التحضير)
+   ========================================================= */
+
+let prepTimers = [];
+
+function startPreparingAnimation() {
+  stopPreparingAnimation();
+  const step2Label = el("prep-step-2").querySelector(".step-label");
+  if (step2Label) {
+    step2Label.textContent = kwMode === "deep"
+      ? t("prep_step_2_deep")
+      : (kwMode === "none" ? t("prep_step_2_none") : t("prep_step_2_kw"));
+  }
+  const seq = [
+    { at: 0, step: 1, progress: 18 },
+    { at: 1100, step: 2, progress: 52 },
+    { at: 2400, step: 3, progress: 82 },
+  ];
+  for (const s of seq) {
+    prepTimers.push(setTimeout(() => {
+      const li = el("prep-step-" + s.step);
+      if (li) { li.classList.add("active"); li.classList.remove("done"); }
+      el("prep-progress").style.width = s.progress + "%";
+    }, s.at));
+  }
+}
+
+function finishPreparingAnimation() {
+  stopPreparingAnimation();
+  [1, 2, 3].forEach((n) => {
+    const li = el("prep-step-" + n);
+    if (li) { li.classList.add("done"); li.classList.remove("active"); }
+  });
+  el("prep-progress").style.width = "100%";
+}
+
+function stopPreparingAnimation() {
+  prepTimers.forEach(clearTimeout);
+  prepTimers = [];
+}
+
+async function startQuiz() {
+  const text = el("input-text").value.trim();
+  const key = el("api-key").value.trim();
+
+  if (!key) {
+    toast("error", t("toast_enter_key_start"));
+    el("api-key").focus();
+    return;
+  }
+  if (text.length < 100) {
+    toast("error", t("toast_text_too_short"));
+    el("input-text").focus();
+    return;
+  }
+  if (el("para-limit").value === "custom" && !String(el("para-limit-custom").value).trim()) {
+    toast("error", t("toast_invalid_para_limit"));
+    el("para-limit-custom").focus();
+    return;
+  }
+
+  state.staticQuestions = null;
+  state.importMeta = null;
+  state.savedRef = null;
+  state.round = 0;
+  mixTypeHistory.clear(); /* نص جديد = تحليل جديد، فتبدأ دورة تنويع الأنماط من صفر */
+  state.abortCtrl = new AbortController();
+  showScreen("preparing");
+  startPreparingAnimation();
+
+  try {
+    const paraLimit = getParagraphLimit();
+    const analysis = await aiAnalyzeText(text, state.abortCtrl.signal, paraLimit, getKwMode() === "deep");
+    if (state.abortCtrl.signal.aborted) return;
+    applyAnalysis(analysis);
+    saveLastSession();
+    finishPreparingAnimation();
+    await sleep(550);
+    if (state.abortCtrl.signal.aborted) return;
+    await beginRound();
+    const activeCount = state.activeParagraphs.length;
+    const paraCount = state.analysis && Array.isArray(state.analysis.paragraphs) ? state.analysis.paragraphs.length : activeCount;
+    const suffix = paraLimit > 0
+      ? (paraCount === paraLimit ? t("suffix_as_requested") : t("suffix_short_text", { limit: paraLimit }))
+      : "";
+    toast("info", getKwMode() === "deep"
+      ? t("toast_prep_done_deep", { paras: paraCountWord(paraCount), qs: quizCountWord(activeCount), suffix })
+      : t("toast_prep_done", { paras: paraCountWord(activeCount), suffix }));
+  } catch (err) {
+    stopPreparingAnimation();
+    if (isAbort(err)) { showScreen("setup"); return; }
+    console.error("[Analyzing]", err);
+    toast("error", friendlyApiError(err));
+    showScreen("setup");
+  }
+}
+
+/* =========================================================
+   7) إدارة جولة الاختبار + وسائل المساعدة الذكية
+   ========================================================= */
+
+function setupRoundScreen() {
+  showScreen("quiz");
+  el("round-chip").classList.toggle("hidden", state.round <= 1);
+  el("round-chip").textContent = t("round_chip", { n: state.round });
+  el("focus-chip").classList.toggle("hidden", !state.focusRestore);
+  el("source-chip").classList.toggle("hidden", !state.staticQuestions);
+  if (state.staticQuestions) {
+    el("source-chip").textContent = state.importMeta && state.importMeta.libId
+      ? t("quiz_source_library")
+      : state.importMeta && state.importMeta.link ? t("quiz_source_link") : t("quiz_source_imported");
+  }
+  const lvl = getDifficulty();
+  el("level-chip").classList.toggle("hidden", lvl === "medium");
+  el("level-chip").textContent = t("level_chip", { label: getDiffLabel(lvl) });
+  el("quiz-streak").classList.add("hidden");
+  el("speed-chip").classList.add("hidden");
+  el("speed-bar").classList.add("hidden");
+}
+
+async function beginRound() {
+  state.round++;
+  state.abortCtrl = new AbortController();
+  state.rendered = null;
+  state.regen = null;
+  closePassageModal();
+  /* إعادة بناء مدخلات الجولة من التحليل: يلتقط تغيّر «أسلوب التوليد» بين الجولات (خاصة الاختبار المعمق)،
+     ومع الخلط تُخلط الفقرات كمجموعات كاملة مع إبقاء أفكار كل فقرة مجتمعة بترتيبها */
+  if (!state.staticQuestions && !state.focusRestore && state.analysis && Array.isArray(state.analysis.paragraphs) && state.analysis.paragraphs.length) {
+    let entries;
+    if (shuffleParagraphsOn && state.analysis.paragraphs.length > 1) {
+      const idxs = shuffle(state.analysis.paragraphs.map((_, idx) => idx));
+      const deep = getKwMode() === "deep";
+      entries = [];
+      idxs.forEach((i) => expandParagraphEntries(state.analysis.paragraphs[i], deep).forEach((e) => {
+        if (e && typeof e === "object") entries.push({ ...e, baseIndex: i });
+      }));
+    } else {
+      entries = buildActiveEntries();
+    }
+    state.activeParagraphs = entries;
+    state.usedKeywords = entries.map(() => []);
+  }
+  state.quiz = {
+    current: 0,
+    score: 0,
+    streak: 0,
+    bestStreak: 0,
+    answers: [],
+    startedAt: Date.now(),
+    timerId: null,
+    speedBonus: 0,
+    qTimerId: null,
+    qDeadline: 0,
+    passagesViewed: 0,
+  };
+  state.pending.clear();
+  state.questions.clear();
+  mixRoundTypes.length = 0; /* جولة جديدة = يبدأ تنويع أنماط «متنوع ذكي» داخل الجولة من صفر */
+  if (state.staticQuestions) {
+    state.staticQuestions.forEach((q) => {
+      q.userAnswer = null;
+      q.correct = null;
+      q.speedFast = false;
+      q.answerMs = null;
+      q.fiftyUsed = false;
+      q.hintUsed = false;
+    });
+  }
+  setupRoundScreen();
+  updateQuizMeta();
+  startTimer();
+  await showCurrentQuestion();
+}
+
+/* اختيار كلمة مفتاحية عشوائية غير مستخدمة سابقًا للفقرة i */
+async function pickKeyword(i) {
+  const p = state.activeParagraphs[i];
+  if (!p.keywords.length) p.keywords = localExtractKeywords(p.text);
+  const used = state.usedKeywords[i];
+  let avail = p.keywords.filter((k) => !used.includes(k));
+
+  if (!avail.length) {
+    let fresh = await aiRefreshKeywords({ paragraph: p.text, exclude: used }, state.abortCtrl && state.abortCtrl.signal);
+    fresh = fresh.filter((k) => k && !used.includes(k));
+    if (!fresh.length) {
+      const base = p.keywords.length ? p.keywords : localExtractKeywords(p.text);
+      fresh = [base[(state.round - 1) % base.length]];
+    }
+    for (const k of fresh) {
+      if (!p.keywords.includes(k)) p.keywords.push(k);
+    }
+    avail = fresh;
+  }
+
+  const kw = avail[Math.floor(Math.random() * avail.length)];
+  used.push(kw);
+  return kw;
+}
+
+function ensureQuestion(i) {
+  if (state.pending.has(i)) return state.pending.get(i);
+  const promise = (async () => {
+    const p = state.activeParagraphs[i];
+    const useKw = getKwMode() === "kw";
+    const keyword = useKw ? await pickKeyword(i) : "";
+    const q = await aiGenerateQuestion(
+      { context: state.analysis.context, paragraph: p.text, keyword, paragraphIndex: i, avoidType: getQType() === "mix" ? (mixTypeHistory.get(i) || "") : "", idea: p.idea || "" },
+      state.abortCtrl ? state.abortCtrl.signal : undefined
+    );
+    const full = {
+      paragraphIndex: i,
+      keyword,
+      idea: p.idea || "",
+      ideaIndex: Number.isInteger(p.ideaIndex) ? p.ideaIndex : null,
+      ideaCount: Number.isInteger(p.ideaCount) ? p.ideaCount : null,
+      ...q,
+      userAnswer: null,
+      correct: null,
+      starred: false,
+      userNote: "",
+      fiftyUsed: false,
+      hintUsed: false,
+    };
+    state.questions.set(i, full);
+    return full;
+  })();
+  promise.catch(() => {});
+  state.pending.set(i, promise);
+  return promise;
+}
+
+async function showCurrentQuestion() {
+  const qz = state.quiz;
+  if (!qz) return;
+  const i = qz.current;
+  stopSpeech();
+
+  if (state.staticQuestions) {
+    const q = state.staticQuestions[i];
+    if (!q) return;
+    state.rendered = q;
+    renderQuestion(q);
+    return;
+  }
+
+  renderQuestionLoading();
+
+  if (i + 1 < state.activeParagraphs.length) {
+    try { ensureQuestion(i + 1); } catch {}
+  }
+
+  try {
+    const q = await ensureQuestion(i);
+    if (state.quiz !== qz || qz.current !== i) return;
+    state.rendered = q;
+    renderQuestion(q);
+  } catch (err) {
+    if (isAbort(err) || state.quiz !== qz) return;
+    console.error("[Question]", err);
+    renderQuestionError(err);
+  }
+}
+
+function renderQuestionLoading() {
+  stopQuestionTimer(true);
+  el("q-text").innerHTML = "";
+  const loader = document.createElement("span");
+  loader.className = "loading-inline";
+  loader.textContent = t("loading_question");
+  el("q-text").appendChild(loader);
+
+  el("q-hint-box").classList.add("hidden");
+  el("q-hint-box").innerHTML = "";
+  el("btn-fifty").disabled = true;
+  el("btn-hint").disabled = true;
+  el("btn-tts-q").disabled = true;
+  el("btn-star-q").disabled = true;
+
+  el("options").innerHTML = "";
+  for (let k = 0; k < 4; k++) {
+    const sk = document.createElement("div");
+    sk.className = "skeleton";
+    el("options").appendChild(sk);
+  }
+  el("feedback").classList.add("hidden");
+  el("feedback").innerHTML = "";
+  el("btn-next").disabled = true;
+  el("btn-next").textContent = t("btn_next");
+  renderQuizDots();
+}
+
+function renderQuestion(q) {
+  const qTextEl = el("q-text");
+  qTextEl.innerHTML = "";
+  qTextEl.appendChild(richFieldFrag(q.question));
+
+  const badge = el("q-type-badge");
+  if (badge) {
+    const t = q.qType || (q.options && q.options.length === 2 ? "tf" : "mcq");
+    badge.textContent = getQTypeLabel(t || "mcq");
+  }
+
+  /* «الاختبار المعمق»: شارة موضع السؤال — رقم الفقرة الأصلية من إجمالي الفقرات + موضع الفكرة بين أفكارها (دون نص الفكرة) */
+  const ideaBadge = el("q-idea-badge");
+  if (ideaBadge) {
+    const idea = q.idea || (state.rendered && state.rendered.idea) || "";
+    if (idea) {
+      const entry = state.activeParagraphs && state.activeParagraphs[q.paragraphIndex] ? state.activeParagraphs[q.paragraphIndex] : {};
+      const paras = state.analysis && Array.isArray(state.analysis.paragraphs) ? state.analysis.paragraphs : [];
+      const baseNum = Number.isInteger(entry.baseIndex) ? entry.baseIndex + 1 : (Number.isInteger(q.paragraphIndex) ? q.paragraphIndex + 1 : 0);
+      const ideaPos = Number.isInteger(q.ideaIndex) && Number.isInteger(q.ideaCount)
+        ? t("idea_pos", { cur: q.ideaIndex + 1, total: q.ideaCount })
+        : t("idea_core");
+      ideaBadge.textContent = baseNum > 0 && paras.length > 0
+        ? t("idea_title_fmt", { base: baseNum, total: paras.length, pos: ideaPos })
+        : ideaPos;
+      ideaBadge.title = idea;
+      ideaBadge.classList.remove("hidden");
+    } else {
+      ideaBadge.textContent = "";
+      ideaBadge.classList.add("hidden");
+    }
+  }
+
+  el("q-hint-box").classList.add("hidden");
+  el("q-hint-box").innerHTML = "";
+
+  const isAnswered = q.userAnswer !== null;
+  el("btn-fifty").disabled = isAnswered || q.fiftyUsed || (q.options && q.options.length <= 2);
+  el("btn-hint").disabled = isAnswered || q.hintUsed || !getPassageForQuestion(q);
+  el("btn-tts-q").disabled = false;
+  el("btn-star-q").disabled = false;
+  syncStarButton(q);
+
+  el("options").innerHTML = "";
+  q.options.forEach((opt, idx) => {
+    const label = document.createElement("label");
+    label.className = "option";
+
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = "option";
+    input.value = String(idx);
+    input.className = "sr-only";
+    input.addEventListener("change", () => selectAnswer(q, idx));
+
+    const letter = document.createElement("span");
+    letter.className = "option-letter";
+    letter.textContent = String(idx + 1);
+
+    const text = document.createElement("span");
+    text.className = "option-text";
+    text.dir = "auto";
+    text.appendChild(richFieldFrag(opt));
+
+    label.appendChild(input);
+    label.appendChild(letter);
+    label.appendChild(text);
+    el("options").appendChild(label);
+  });
+
+  el("feedback").classList.add("hidden");
+  el("feedback").innerHTML = "";
+  el("btn-next").disabled = true;
+  el("btn-next").textContent = t("btn_next");
+  renderQuizDots();
+  startQuestionTimer(q);
+}
+
+/* ====== وسائل المساعدة الذكية (50:50 + تلميح + نجمة + خريطة الأسئلة) ====== */
+function activateFiftyLifeline() {
+  const q = state.rendered;
+  if (!q || q.userAnswer !== null || q.fiftyUsed || !q.options || q.options.length <= 2) return;
+  const wrongIndices = q.options.map((_, idx) => idx).filter((idx) => idx !== q.correctIndex);
+  shuffle(wrongIndices);
+  const toEliminate = wrongIndices.slice(0, 2);
+  const labels = [...el("options").children];
+  toEliminate.forEach((idx) => {
+    const lbl = labels[idx];
+    if (!lbl) return;
+    lbl.classList.add("eliminated");
+    const inp = lbl.querySelector("input");
+    if (inp) inp.disabled = true;
+  });
+  q.fiftyUsed = true;
+  el("btn-fifty").disabled = true;
+  toast("info", t("toast_fifty_used"));
+}
+
+function activateHintLifeline() {
+  const q = state.rendered;
+  if (!q || q.userAnswer !== null || q.hintUsed) return;
+  const passage = getPassageForQuestion(q);
+  if (!passage || !passage.text) {
+    toast("info", t("toast_no_hint"));
+    return;
+  }
+  const sentences = String(passage.text)
+    .split(/(?<=[.!؟?\n])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 15);
+  let target = "";
+  if (q.keyword) {
+    target = sentences.find((s) => s.includes(q.keyword)) || "";
+  }
+  if (!target) {
+    target = sentences[0] || passage.text.slice(0, 160);
+  }
+  const correctOpt = String(q.options[q.correctIndex] || "").trim();
+  if (correctOpt.length >= 4 && target.includes(correctOpt)) {
+    target = target.replace(correctOpt, "«...»");
+  }
+  const box = el("q-hint-box");
+  box.innerHTML = "";
+  const strong = document.createElement("strong");
+  strong.textContent = t("hint_heading");
+  box.appendChild(strong);
+  box.appendChild(mathRichFrag(" " + target));
+  box.classList.remove("hidden");
+  q.hintUsed = true;
+  el("btn-hint").disabled = true;
+}
+
+function syncStarButton(q) {
+  const btn = el("btn-star-q");
+  if (!btn || !q) return;
+  const on = !!q.starred;
+  btn.classList.toggle("starred", on);
+  btn.setAttribute("aria-pressed", on ? "true" : "false");
+}
+
+function toggleStarCurrentQuestion() {
+  const q = state.rendered;
+  if (!q) return;
+  q.starred = !q.starred;
+  syncStarButton(q);
+  renderQuizDots();
+  updateSavedProgress();
+  toast("info", q.starred ? t("toast_starred") : t("toast_unstarred"));
+}
+
+function renderQuizDots() {
+  const wrap = el("quiz-dots");
+  if (!wrap || !state.quiz) return;
+  const total = state.activeParagraphs.length;
+  wrap.innerHTML = "";
+  if (total <= 1) {
+    wrap.classList.add("hidden");
+    return;
+  }
+  wrap.classList.remove("hidden");
+  for (let i = 0; i < total; i++) {
+    const q = state.staticQuestions ? state.staticQuestions[i] : state.questions.get(i);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "quiz-dot";
+    btn.textContent = String(i + 1);
+    const isAnswered = q && q.userAnswer !== null;
+    if (i === state.quiz.current) btn.classList.add("current");
+    if (isAnswered) {
+      btn.classList.add("answered", q.correct ? "ok" : "bad");
+      btn.title = t("dot_answered_title", { n: i + 1, status: q.correct ? t("dot_correct") : t("dot_wrong") });
+      btn.addEventListener("click", () => openPassageModal(q));
+    } else {
+      btn.title = i === state.quiz.current ? t("dot_current_title", { n: i + 1 }) : t("dot_q_title", { n: i + 1 });
+    }
+    if (q && q.starred) btn.classList.add("starred");
+    wrap.appendChild(btn);
+  }
+}
+
+function renderQuestionError(err) {
+  el("q-text").textContent = t("q_err_title");
+  el("options").innerHTML = "";
+
+  const fb = el("feedback");
+  fb.className = "feedback error";
+  fb.innerHTML = "";
+
+  const icon = document.createElement("div");
+  icon.className = "feedback-icon";
+  icon.textContent = "!";
+
+  const body = document.createElement("div");
+  body.className = "feedback-body";
+  const strong = document.createElement("strong");
+  strong.textContent = t("q_err_heading");
+  const p = document.createElement("p");
+  p.textContent = friendlyApiError(err);
+  body.appendChild(strong);
+  body.appendChild(p);
+
+  const retry = document.createElement("button");
+  retry.className = "btn ghost sm";
+  retry.type = "button";
+  retry.textContent = t("btn_retry");
+  retry.style.marginTop = "10px";
+  retry.addEventListener("click", () => {
+    if (!state.quiz) return;
+    state.pending.delete(state.quiz.current);
+    showCurrentQuestion();
+  });
+  body.appendChild(retry);
+
+  fb.appendChild(icon);
+  fb.appendChild(body);
+  fb.classList.remove("hidden");
+}
+
+function selectAnswer(q, idx) {
+  const qz = state.quiz;
+  if (!qz || q.userAnswer !== null) return;
+
+  stopQuestionTimer(true);
+  stopSpeech();
+  q.userAnswer = idx;
+  q.correct = idx === q.correctIndex;
+  q.answerMs = speedSettings.on && qz.qDeadline ? Date.now() - (qz.qDeadline - speedSettings.secs * 1000) : null;
+  q.speedFast = !!(speedSettings.on && q.correct && qz.qDeadline && Date.now() <= qz.qDeadline - (speedSettings.secs * 1000) / 2);
+  if (q.regen) {
+    q.answerMs = null;
+    q.speedFast = false;
+  } else {
+    if (q.speedFast) qz.speedBonus++;
+    if (q.correct) {
+      qz.score++;
+      qz.streak++;
+      qz.bestStreak = Math.max(qz.bestStreak, qz.streak);
+    } else {
+      qz.streak = 0;
+    }
+    qz.answers.push(q);
+    updateSavedProgress();
+  }
+  if (q.correct) playCorrect();
+  else playWrong();
+
+  el("btn-fifty").disabled = true;
+  el("btn-hint").disabled = true;
+
+  if (!q.regen) {
+    const streakChip = el("quiz-streak");
+    if (qz.streak >= 2) {
+      streakChip.querySelector("span").textContent = t("streak_chip", { n: qz.streak });
+      streakChip.classList.remove("hidden");
+    } else {
+      streakChip.classList.add("hidden");
+    }
+  }
+
+  const labels = [...el("options").children];
+  labels.forEach((label, i) => {
+    const input = label.querySelector("input");
+    if (input) input.disabled = true;
+    label.classList.add("locked");
+    if (i === q.correctIndex) label.classList.add("correct");
+    else if (i === idx) label.classList.add("wrong");
+    else label.classList.add("dim");
+  });
+
+  showFeedback(q);
+  updateQuizMeta();
+  renderQuizDots();
+  scrollFeedbackIntoView();
+
+  const isLast = qz.current === state.activeParagraphs.length - 1;
+  el("btn-next").disabled = false;
+  el("btn-next").textContent = isLast ? t("btn_show_results") : t("btn_next_q");
+}
+
+function scrollFeedbackIntoView() {
+  const fb = el("feedback");
+  if (!fb.classList.contains("hidden") && fb.scrollIntoView) {
+    try { fb.scrollIntoView({ behavior: "smooth", block: "nearest" }); } catch {}
+  }
+}
+
+/* ====== نافذة الفقرة المنبثقة ====== */
+const BOOK_ICON = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>';
+let passageReturnFocus = null;
+
+function getPassageForQuestion(q) {
+  if (!q) return null;
+  if (!state.staticQuestions) {
+    const p = state.activeParagraphs[q.paragraphIndex];
+    if (p && p.text) {
+      const res = { title: t("passage_title_default"), text: p.text };
+      if (p.idea) res.idea = p.idea;
+      return res;
+    }
+  }
+  const ctx = state.analysis && state.analysis.context ? String(state.analysis.context).trim() : "";
+  if (ctx) return { title: t("passage_context_title"), text: ctx };
+  return null;
+}
+
+/* شارة سياق فوق نص الفقرة: الكلمة المفتاحية (أسلوب kw) أو الفكرة الأساسية (الاختبار المعمق) */
+function renderPassageChip(kwWrap, label, value) {
+  kwWrap.innerHTML = "";
+  if (!value) {
+    kwWrap.classList.add("hidden");
+    return;
+  }
+  const chip = document.createElement("span");
+  chip.className = "modal-kw-chip" + (label.includes("الفكرة") || /idea/i.test(label) ? " idea-chip" : "");
+  chip.appendChild(document.createTextNode(label + ": "));
+  const strong = document.createElement("strong");
+  strong.textContent = value;
+  chip.appendChild(strong);
+  kwWrap.appendChild(chip);
+  kwWrap.classList.remove("hidden");
+}
+
+function isPassageOpen() {
+  return !el("passage-overlay").classList.contains("hidden");
+}
+
+let passageNavIdx = -1;
+let passageNavMax = -1;
+
+function openPassageModal(q) {
+  const passage = getPassageForQuestion(q);
+  if (!passage) {
+    toast("info", t("toast_no_passage"));
+    return;
+  }
+  if (state.quiz) state.quiz.passagesViewed = (state.quiz.passagesViewed || 0) + 1;
+
+  const navBase = (!state.staticQuestions && q && Number.isInteger(q.paragraphIndex) &&
+    state.activeParagraphs[q.paragraphIndex] && state.activeParagraphs.length > 1) ? q.paragraphIndex : -1;
+  passageNavIdx = navBase;
+  passageNavMax = state.quiz && el("screen-quiz").classList.contains("active")
+    ? Math.max(navBase, state.quiz.current)
+    : (state.activeParagraphs.length - 1);
+  el("passage-nav").classList.toggle("hidden", navBase < 0);
+  el("passage-hint").innerHTML = navBase >= 0
+    ? t("passage_hint_nav_html")
+    : t("passage_hint_static_html");
+
+  if (navBase >= 0) {
+    renderPassageAt(navBase, false, q);
+  } else {
+    renderPassageStatic(passage, q);
+  }
+
+  el("btn-passage-continue").textContent =
+    el("screen-quiz").classList.contains("active") ? t("btn_passage_continue") : t("btn_close");
+
+  passageReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  el("passage-overlay").classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+  try { el("btn-passage-continue").focus(); } catch {}
+}
+
+function renderPassageStatic(passage, q) {
+  el("passage-title-text").textContent = passage.title;
+  const kwWrap = el("passage-kw");
+  if (q && q.keyword) {
+    renderPassageChip(kwWrap, t("fc_front_label"), q.keyword);
+  } else {
+    renderPassageChip(kwWrap, t("idea_core"), (q && q.idea) || passage.idea || "");
+  }
+  const body = el("passage-body");
+  body.innerHTML = "";
+  body.appendChild(passageRichFrag(passage.text, q && q.keyword));
+  body.scrollTop = 0;
+}
+
+function renderPassageAt(idx, animate, baseQ) {
+  const p = state.activeParagraphs[idx];
+  if (!p || !p.text) return false;
+  const navQ = (baseQ && baseQ.paragraphIndex === idx && baseQ.keyword)
+    ? baseQ
+    : ((state.questions && state.questions.get(idx)) || null);
+  const kw = (navQ && navQ.keyword) || "";
+  el("passage-title-text").textContent = t("passage_title_num", { n: idx + 1 });
+  if (kw) {
+    renderPassageChip(el("passage-kw"), t("fc_front_label"), kw);
+  } else {
+    renderPassageChip(el("passage-kw"), t("idea_core"), p.idea || (navQ && navQ.idea) || "");
+  }
+  const body = el("passage-body");
+  body.innerHTML = "";
+  body.appendChild(passageRichFrag(p.text, kw));
+  body.scrollTop = 0;
+  if (animate) {
+    body.classList.remove("nav-anim");
+    void body.offsetWidth;
+    body.classList.add("nav-anim");
+  }
+  el("passage-nav-pos").textContent = t("passage_nav_pos", { cur: idx + 1, total: passageNavMax + 1 });
+  el("btn-passage-prev").disabled = idx <= 0;
+  el("btn-passage-next").disabled = idx >= passageNavMax;
+  return true;
+}
+
+function passageGo(dir) {
+  if (passageNavIdx < 0) return;
+  const target = passageNavIdx + dir;
+  if (target < 0 || target > passageNavMax) return;
+  passageNavIdx = target;
+  renderPassageAt(passageNavIdx, true);
+}
+
+function closePassageModal() {
+  const overlay = el("passage-overlay");
+  if (overlay.classList.contains("hidden")) return;
+  stopSpeech();
+  overlay.classList.add("hidden");
+  document.body.style.overflow = "";
+  if (passageReturnFocus && document.contains(passageReturnFocus)) {
+    try { passageReturnFocus.focus(); } catch {}
+  }
+  passageReturnFocus = null;
+}
+
+function trapPassageTab(e) {
+  const focusables = [...el("passage-overlay").querySelectorAll("button, [tabindex='0']")]
+    .filter((n) => !n.disabled && n.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+const TIP_PASSAGE_KEY = "quiz_tip_passage_v1";
+let passageTipTimer = null;
+
+function maybeShowPassageTip(container) {
+  if (!container || store.get(TIP_PASSAGE_KEY)) return;
+  if (!container.querySelector(".passage-btn")) return;
+  store.set(TIP_PASSAGE_KEY, "1");
+  const tip = document.createElement("div");
+  tip.className = "passage-tip";
+  tip.setAttribute("role", "note");
+  const txt = document.createElement("span");
+  txt.textContent = t("tip_passage_text");
+  const ok = document.createElement("button");
+  ok.type = "button";
+  ok.className = "btn sm";
+  ok.textContent = t("tip_passage_ok");
+  ok.addEventListener("click", dismissPassageTip);
+  tip.appendChild(txt);
+  tip.appendChild(ok);
+  container.appendChild(tip);
+  passageTipTimer = setTimeout(dismissPassageTip, 10000);
+}
+
+function dismissPassageTip() {
+  if (passageTipTimer) { clearTimeout(passageTipTimer); passageTipTimer = null; }
+  const tip = document.querySelector(".passage-tip");
+  if (!tip) return;
+  tip.classList.add("leaving");
+  setTimeout(() => tip.remove(), 250);
+}
+
+const PENCIL_ICON = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>';
+
+function appendPassageButton(container, q, label) {
+  if (!getPassageForQuestion(q) || !container) return;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn sm passage-btn";
+  btn.innerHTML = BOOK_ICON;
+  btn.appendChild(document.createTextNode(label || t("btn_read_passage")));
+  btn.addEventListener("click", () => openPassageModal(q));
+  container.appendChild(btn);
+}
+
+/* حقل ملاحظة المتعلم الشخصية داخل التغذية الراجعة */
+function appendNoteEditor(container, q) {
+  if (!container || !q) return;
+  const wrap = document.createElement("div");
+  wrap.className = "q-note-wrap";
+  const ta = document.createElement("textarea");
+  ta.className = "q-note-input";
+  ta.rows = 1;
+  ta.maxLength = 300;
+  ta.dir = "auto";
+  ta.placeholder = t("note_placeholder");
+  ta.value = q.userNote || "";
+  ta.addEventListener("input", () => {
+    q.userNote = ta.value;
+    updateSavedProgress();
+  });
+  wrap.appendChild(ta);
+  container.appendChild(wrap);
+}
+
+/* ====== مؤقت السؤال (وضع السرعة) ====== */
+function startQuestionTimer(q) {
+  stopQuestionTimer();
+  const qz = state.quiz;
+  if (!speedSettings.on || !qz || q.userAnswer !== null) return;
+  const totalMs = speedSettings.secs * 1000;
+  qz.qDeadline = Date.now() + totalMs;
+  const chip = el("speed-chip");
+  const fill = el("speed-bar-fill");
+  const bar = el("speed-bar");
+  chip.classList.remove("hidden", "danger");
+  bar.classList.remove("hidden", "danger");
+  const update = () => {
+    if (!state.quiz || state.quiz !== qz || state.rendered !== q || q.userAnswer !== null) {
+      stopQuestionTimer();
+      return;
+    }
+    const remain = qz.qDeadline - Date.now();
+    const frac = Math.max(0, remain / totalMs);
+    el("speed-value").textContent = String(Math.max(0, Math.ceil(remain / 1000)));
+    fill.style.width = (frac * 100) + "%";
+    const danger = remain < totalMs * 0.3;
+    chip.classList.toggle("danger", danger);
+    bar.classList.toggle("danger", danger);
+    if (remain <= 0) {
+      stopQuestionTimer();
+      handleTimeout(q);
+    }
+  };
+  update();
+  qz.qTimerId = setInterval(update, 100);
+}
+
+function stopQuestionTimer(hide) {
+  if (state.quiz && state.quiz.qTimerId) {
+    clearInterval(state.quiz.qTimerId);
+    state.quiz.qTimerId = null;
+  }
+  if (hide) {
+    el("speed-chip").classList.add("hidden");
+    el("speed-bar").classList.add("hidden");
+  }
+}
+
+function handleTimeout(q) {
+  const qz = state.quiz;
+  if (!qz || q.userAnswer !== null) return;
+
+  stopQuestionTimer(true);
+  stopSpeech();
+  q.userAnswer = -1;
+  q.correct = false;
+  q.speedFast = false;
+  q.answerMs = null;
+  if (!q.regen) {
+    qz.streak = 0;
+    qz.answers.push(q);
+    updateSavedProgress();
+  }
+  playWrong();
+
+  el("btn-fifty").disabled = true;
+  el("btn-hint").disabled = true;
+
+  const labels = [...el("options").children];
+  labels.forEach((label, i) => {
+    const input = label.querySelector("input");
+    if (input) input.disabled = true;
+    label.classList.add("locked");
+    if (i === q.correctIndex) label.classList.add("correct");
+    else label.classList.add("dim");
+  });
+
+  const fb = el("feedback");
+  fb.innerHTML = "";
+  fb.className = "feedback wrong timeout";
+
+  const icon = document.createElement("div");
+  icon.className = "feedback-icon";
+  icon.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="7" x2="12" y2="12"/><line x1="12" y1="12" x2="15.5" y2="14"/></svg>';
+
+  const body = document.createElement("div");
+  body.className = "feedback-body";
+  const strong = document.createElement("strong");
+  strong.textContent = t("fb_timeout");
+  strong.appendChild(document.createTextNode("«"));
+  strong.appendChild(richFieldFrag(q.options[q.correctIndex]));
+  strong.appendChild(document.createTextNode("»"));
+  const p = document.createElement("p");
+  p.dir = "auto";
+  p.appendChild(richFieldFrag(q.explanation || t("fb_no_explain")));
+  body.appendChild(strong);
+  body.appendChild(p);
+  const actRow = document.createElement("div");
+  actRow.className = "fb-actions-row";
+  appendPassageButton(actRow, q, t("btn_read_passage"));
+  appendRegenButton(actRow, q);
+  body.appendChild(actRow);
+  appendNoteEditor(body, q);
+
+  fb.appendChild(icon);
+  fb.appendChild(body);
+  fb.classList.remove("hidden");
+  updateQuizMeta();
+  renderQuizDots();
+  scrollFeedbackIntoView();
+
+  const isLast = qz.current === state.activeParagraphs.length - 1;
+  el("btn-next").disabled = false;
+  el("btn-next").textContent = isLast ? t("btn_show_results") : t("btn_next_q");
+}
+
+function showFeedback(q) {
+  const fb = el("feedback");
+  fb.innerHTML = "";
+  fb.className = "feedback " + (q.correct ? "correct" : "wrong");
+
+  const icon = document.createElement("div");
+  icon.className = "feedback-icon";
+  icon.textContent = q.correct ? "✓" : "✕";
+
+  const body = document.createElement("div");
+  body.className = "feedback-body";
+
+  const strong = document.createElement("strong");
+  if (q.correct) {
+    strong.textContent = t("fb_correct");
+  } else {
+    strong.textContent = t("fb_wrong");
+    strong.appendChild(document.createTextNode("«"));
+    strong.appendChild(richFieldFrag(q.options[q.correctIndex]));
+    strong.appendChild(document.createTextNode("»"));
+  }
+
+  const p = document.createElement("p");
+  p.dir = "auto";
+  p.appendChild(richFieldFrag(q.explanation || t("fb_no_explain")));
+
+  body.appendChild(strong);
+  body.appendChild(p);
+  const actRow = document.createElement("div");
+  actRow.className = "fb-actions-row";
+  appendPassageButton(actRow, q, t("btn_read_passage"));
+  appendRegenButton(actRow, q);
+  body.appendChild(actRow);
+  if (q.regen) {
+    const note = document.createElement("span");
+    note.className = "regen-note";
+    note.textContent = t("fb_regen_note");
+    body.appendChild(note);
+  }
+  appendNoteEditor(body, q);
+  maybeShowPassageTip(body);
+  fb.appendChild(icon);
+  fb.appendChild(body);
+  fb.classList.remove("hidden");
+}
+
+/* ====== إعادة توليد السؤال بعد الإجابة ====== */
+let regenBusy = false;
+const REGEN_ICON = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
+
+function appendRegenButton(container, q) {
+  if (!container || !q || state.staticQuestions) return;
+  if (!Number.isInteger(q.paragraphIndex) || !state.activeParagraphs[q.paragraphIndex]) return;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn ghost sm regen-btn";
+  btn.innerHTML = REGEN_ICON;
+  btn.appendChild(document.createTextNode(t("btn_regen_q")));
+  btn.addEventListener("click", () => regenerateQuestion(q.paragraphIndex, btn));
+  container.appendChild(btn);
+}
+
+function renderAnsweredQuestion(q) {
+  renderQuestion(q);
+  stopQuestionTimer(true);
+  const labels = [...el("options").children];
+  labels.forEach((label, i) => {
+    const input = label.querySelector("input");
+    if (input) input.disabled = true;
+    label.classList.add("locked");
+    if (i === q.correctIndex) label.classList.add("correct");
+    else if (i === q.userAnswer) label.classList.add("wrong");
+    else label.classList.add("dim");
+  });
+  showFeedback(q);
+  if (state.quiz) {
+    const isLast = state.quiz.current === state.activeParagraphs.length - 1;
+    el("btn-next").disabled = false;
+    el("btn-next").textContent = isLast ? t("btn_show_results") : t("btn_next_q");
+  }
+}
+
+async function regenerateQuestion(i, btn) {
+  const qz = state.quiz;
+  if (!qz || regenBusy || state.staticQuestions) return;
+  const p = state.activeParagraphs[i];
+  if (!p) return;
+  regenBusy = true;
+  if (btn) { btn.disabled = true; btn.classList.add("busy"); }
+  renderQuestionLoading();
+  try {
+    const useKw = getKwMode() === "kw";
+    const keyword = useKw ? await pickKeyword(i) : "";
+    const orig = state.questions.get(i);
+    /* «متنوع ذكي»: مرّر نمط السؤال السابق ليطلب النموذج نمطًا آخر هذه المرة (تنويع التدريب) */
+    const prevType = getQType() === "mix" && orig && orig.qType && orig.qType !== "mix" ? orig.qType : "";
+    const nq = await aiGenerateQuestion(
+      { context: state.analysis.context, paragraph: p.text, keyword, paragraphIndex: i, avoidType: prevType, idea: p.idea || "" },
+      state.abortCtrl ? state.abortCtrl.signal : undefined
+    );
+    if (state.quiz !== qz || qz.current !== i) return;
+    const full = {
+      paragraphIndex: i,
+      keyword,
+      idea: p.idea || "",
+      ideaIndex: Number.isInteger(p.ideaIndex) ? p.ideaIndex : null,
+      ideaCount: Number.isInteger(p.ideaCount) ? p.ideaCount : null,
+      ...nq,
+      userAnswer: null,
+      correct: null,
+      regen: true,
+      starred: orig ? !!orig.starred : false,
+      userNote: orig ? (orig.userNote || "") : "",
+    };
+    state.regen = { i, q: full };
+    state.rendered = full;
+    renderQuestion(full);
+  } catch (err) {
+    if (isAbort(err)) return;
+    console.error("[Regen]", err);
+    toast("error", friendlyApiError(err));
+    const orig = state.questions.get(i);
+    if (orig && state.quiz === qz && qz.current === i) {
+      state.rendered = orig;
+      renderAnsweredQuestion(orig);
+    }
+  } finally {
+    regenBusy = false;
+    if (btn) { btn.disabled = false; btn.classList.remove("busy"); }
+  }
+}
+
+async function nextQuestion() {
+  const qz = state.quiz;
+  if (!qz || el("btn-next").disabled) return;
+
+  state.regen = null;
+  const last = state.activeParagraphs.length - 1;
+  if (qz.current >= last) {
+    finishQuiz();
+    return;
+  }
+  qz.current++;
+  updateQuizMeta();
+  await showCurrentQuestion();
+  updateSavedProgress();
+}
+
+function updateQuizMeta() {
+  const qz = state.quiz;
+  if (!qz) return;
+  const total = state.activeParagraphs.length;
+  el("quiz-progress-text").textContent = t("quiz_progress_fmt", { cur: Math.min(qz.current + 1, total), total });
+  el("quiz-score").textContent = t("quiz_score_fmt", { score: qz.score });
+  el("quiz-progress-bar").style.width = (qz.answers.length / total) * 100 + "%";
+}
+
+/* ====== المؤقت ====== */
+function startTimer() {
+  stopTimer();
+  const qz = state.quiz;
+  if (!qz) return;
+  el("quiz-timer-value").textContent = "0:00";
+  qz.timerId = setInterval(() => {
+    if (!state.quiz) return;
+    el("quiz-timer-value").textContent = fmtDuration(Date.now() - state.quiz.startedAt);
+  }, 1000);
+}
+
+function stopTimer() {
+  if (state.quiz && state.quiz.timerId) {
+    clearInterval(state.quiz.timerId);
+    state.quiz.timerId = null;
+  }
+}
+
+/* =========================================================
+   8) النتائج + تصفية المراجعة والبحث
+   ========================================================= */
+
+let lastResults = null;
+let reviewFilter = "all";
+
+function finishQuiz() {
+  if (!state.quiz || state.quiz.finished) return;
+  state.quiz.finished = true;
+  updateSavedProgress();
+  stopTimer();
+  stopQuestionTimer(true);
+  stopSpeech();
+  const qz = state.quiz;
+  const total = state.activeParagraphs.length;
+  const score = qz.score;
+  const elapsed = Date.now() - qz.startedAt;
+  const pct = total ? Math.round((score / total) * 100) : 0;
+
+  playFinish();
+
+  saveHistoryItem({
+    date: Date.now(),
+    score,
+    total,
+    pct,
+    round: state.round,
+    focus: !!state.focusRestore,
+    imported: !!state.staticQuestions,
+    lvl: getDifficulty(),
+    duration: elapsed,
+    preview: state.staticQuestions && state.importMeta
+      ? t("imported_prefix") + state.importMeta.name
+      : el("input-text").value.trim().slice(0, 42),
+  });
+
+  const allHistory = loadHistory();
+  evaluateAchievements({
+    pct,
+    total,
+    bestStreak: qz.bestStreak || 0,
+    speedBonus: qz.answers.filter((a) => a.speedFast).length,
+    passagesViewed: qz.passagesViewed || 0,
+    isFocus: !!state.focusRestore,
+    lvl: getDifficulty(),
+    historyCount: allHistory.length,
+  });
+
+  if (state.savedRef && !state.focusRestore) {
+    withItem(state.savedRef.listId, state.savedRef.itemId, (it) => {
+      it.plays = (it.plays || 0) + 1;
+      it.bestPct = Math.max(it.bestPct || 0, pct);
+      it.lastPct = pct;
+      it.updatedAt = Date.now();
+      if (it.source === "session") it.progress = null;
+    });
+  }
+  if (!state.focusRestore) state.roundPcts.push(pct);
+
+  showScreen("results");
+  renderResults(score, total, elapsed, state.round, qz.answers, qz.bestStreak || 0, pct);
+
+  const cmp = el("compare-chip");
+  if (state.focusRestore) {
+    cmp.className = "chip accent";
+    cmp.textContent = t("cmp_focus");
+    cmp.classList.remove("hidden");
+  } else {
+    const prev = state.roundPcts.length > 1 ? state.roundPcts[state.roundPcts.length - 2] : null;
+    if (prev !== null) {
+      const d = pct - prev;
+      if (d === 0) {
+        cmp.className = "chip";
+        cmp.textContent = t("cmp_same");
+      } else {
+        cmp.className = "chip " + (d > 0 ? "ok" : "bad");
+        cmp.textContent = d > 0 ? t("cmp_improved", { d }) : t("cmp_declined", { d });
+      }
+      cmp.classList.remove("hidden");
+    } else {
+      cmp.classList.add("hidden");
+    }
+  }
+
+  renderHistory();
+}
+
+function renderResults(score, total, elapsed, round, answers, bestStreak, pct) {
+  lastResults = { score, total, pct, elapsed, round, answers, bestStreak, passagesViewed: state.quiz ? state.quiz.passagesViewed || 0 : 0 };
+
+  const C = 2 * Math.PI * 54;
+  const ring = el("ring-fg");
+  ring.style.strokeDashoffset = String(C);
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      ring.style.strokeDashoffset = String(C * (1 - score / (total || 1)));
+    });
+  });
+
+  el("score-num").textContent = `${score}/${total}`;
+  el("score-pct").textContent = pct + "%";
+
+  let msg;
+  if (pct >= 90) msg = t("msg_score_90");
+  else if (pct >= 70) msg = t("msg_score_70");
+  else if (pct >= 50) msg = t("msg_score_50");
+  else msg = t("msg_score_low");
+  el("score-message").textContent = msg;
+
+  el("stat-correct").textContent = t("stat_correct", { n: score });
+  el("stat-wrong").textContent = t("stat_wrong", { n: total - score });
+  el("stat-time").textContent = t("stat_time", { t: fmtDuration(elapsed) });
+  el("stat-round").textContent = t("stat_round", { n: round });
+  el("stat-streak").textContent = t("stat_streak", { n: bestStreak || 0 });
+  const passages = state.quiz ? state.quiz.passagesViewed || 0 : 0;
+  const passageChip = el("stat-passage");
+  if (passages > 0) {
+    el("stat-passage-text").textContent = isEn() ? `Passages read: ${passages}x` : `قراءة الفقرة: ${passages} ${passages === 1 ? "مرة" : passages === 2 ? "مرتين" : "مرات"}`;
+    passageChip.classList.remove("hidden");
+  } else {
+    passageChip.classList.add("hidden");
+  }
+  const lvlChip = el("stat-level");
+  if (getDifficulty() !== "medium") {
+    lvlChip.textContent = t("level_chip", { label: getDiffLabel(getDifficulty()) });
+    lvlChip.classList.remove("hidden");
+  } else {
+    lvlChip.classList.add("hidden");
+  }
+  el("btn-retry-wrong").classList.toggle("hidden", total - score === 0);
+
+  const fastCount = answers.filter((a) => a.speedFast).length;
+  const speedChip = el("stat-speed");
+  if (fastCount > 0) {
+    el("stat-speed-text").textContent = t("stat_speed", { n: fastCount });
+    speedChip.classList.remove("hidden");
+  } else {
+    speedChip.classList.add("hidden");
+  }
+  const times = answers.map((a) => a.answerMs).filter((t) => typeof t === "number" && t >= 0);
+  const fastestChip = el("stat-fastest");
+  if (times.length) {
+    fastestChip.textContent = t("stat_fastest", { s: (Math.min.apply(null, times) / 1000).toFixed(1) });
+    fastestChip.classList.remove("hidden");
+  } else {
+    fastestChip.classList.add("hidden");
+  }
+
+  if (pct >= 80) burstConfetti();
+
+  reviewFilter = "all";
+  document.querySelectorAll(".rev-filter").forEach((b) => b.classList.toggle("active", b.dataset.filter === "all"));
+  const rs = el("review-search");
+  if (rs) rs.value = "";
+  renderReviewList();
+}
+
+function renderReviewList() {
+  const list = el("review-list");
+  if (!list || !lastResults) return;
+  list.innerHTML = "";
+  const query = String((el("review-search") && el("review-search").value) || "").trim().toLowerCase();
+
+  const items = lastResults.answers
+    .map((q, i) => ({ q, i }))
+    .filter(({ q }) => {
+      if (reviewFilter === "wrong" && q.correct) return false;
+      if (reviewFilter === "correct" && !q.correct) return false;
+      if (reviewFilter === "starred" && !q.starred) return false;
+      if (reviewFilter === "noted" && !(q.userNote && q.userNote.trim())) return false;
+      if (query) {
+        const hay = [q.question, ...(q.options || []), q.explanation || "", q.userNote || "", q.keyword || "", q.idea || ""].join(" ").toLowerCase();
+        if (!hay.includes(query)) return false;
+      }
+      return true;
+    });
+
+  if (!items.length) {
+    const empty = document.createElement("li");
+    empty.className = "review-item";
+    empty.style.textAlign = "center";
+    empty.style.color = "var(--muted)";
+    empty.textContent = t("review_empty");
+    list.appendChild(empty);
+    return;
+  }
+
+  items.forEach(({ q, i }) => {
+    const li = document.createElement("li");
+    li.className = "review-item " + (q.correct ? "correct-item" : "wrong-item");
+
+    const head = document.createElement("div");
+    head.className = "review-head";
+    const num = document.createElement("span");
+    num.className = "review-num";
+    num.textContent = String(i + 1);
+    const qText = document.createElement("span");
+    qText.className = "review-q";
+    qText.appendChild(richFieldFrag(q.question));
+
+    const starBtn = document.createElement("button");
+    starBtn.type = "button";
+    starBtn.className = "review-star-btn" + (q.starred ? " on" : "");
+    starBtn.textContent = q.starred ? "★" : "☆";
+    starBtn.title = t("review_star_title");
+    starBtn.addEventListener("click", () => {
+      q.starred = !q.starred;
+      renderReviewList();
+    });
+
+    head.appendChild(num);
+    head.appendChild(qText);
+    head.appendChild(starBtn);
+
+    const rows = document.createElement("div");
+    rows.className = "review-rows";
+    const your = document.createElement("div");
+    your.className = q.correct ? "ok" : "no";
+    if (q.userAnswer === -1) {
+      your.textContent = t("review_your_timeout");
+    } else {
+      your.textContent = t("review_your");
+      your.appendChild(richFieldFrag(q.options[q.userAnswer]));
+    }
+    rows.appendChild(your);
+    if (!q.correct) {
+      const right = document.createElement("div");
+      right.className = "ok";
+      right.textContent = t("review_right");
+      right.appendChild(richFieldFrag(q.options[q.correctIndex]));
+      rows.appendChild(right);
+    }
+
+    const explain = document.createElement("div");
+    explain.className = "review-explain";
+    explain.dir = "auto";
+    explain.textContent = t("review_explain");
+    explain.appendChild(richFieldFrag(q.explanation || "—"));
+
+    li.appendChild(head);
+    /* «الاختبار المعمق»: الفكرة الأساسية التي يتناولها السؤال — تحت عنوان السؤال مباشرة */
+    if (q.idea) {
+      const ideaRow = document.createElement("div");
+      ideaRow.className = "review-idea";
+      ideaRow.dir = "auto";
+      ideaRow.textContent = t("review_idea") + q.idea;
+      li.appendChild(ideaRow);
+    }
+    li.appendChild(rows);
+    li.appendChild(explain);
+    if (q.userNote && q.userNote.trim()) {
+      const un = document.createElement("div");
+      un.className = "review-user-note";
+      un.dir = "auto";
+      un.textContent = t("review_note") + q.userNote.trim();
+      li.appendChild(un);
+    }
+    appendPassageButton(li, q, t("btn_view_passage"));
+    list.appendChild(li);
+  });
+}
+
+async function retakeQuiz() {
+  restoreFullParagraphs();
+  state.abortCtrl = new AbortController();
+  await beginRound();
+  toast("info", t("toast_retake"));
+}
+
+/* ====== وضع التدريب على الأخطاء فقط ====== */
+function restoreFullParagraphs() {
+  if (!state.focusRestore) return;
+  state.activeParagraphs = state.focusRestore.active;
+  state.usedKeywords = state.focusRestore.used;
+  state.staticQuestions = state.focusRestore.static || null;
+  state.focusRestore = null;
+}
+
+async function retryWrongOnly() {
+  if (!lastResults) return;
+  const wrongIdx = [...new Set(lastResults.answers.filter((q) => !q.correct).map((q) => q.paragraphIndex))]
+    .filter((i) => state.activeParagraphs[i]);
+  if (!wrongIdx.length) {
+    toast("success", t("toast_no_wrong"));
+    return;
+  }
+  state.focusRestore = {
+    active: state.activeParagraphs,
+    used: state.usedKeywords,
+    static: state.staticQuestions,
+  };
+  state.activeParagraphs = wrongIdx.map((i) => state.focusRestore.active[i]);
+  state.usedKeywords = wrongIdx.map((i) => state.focusRestore.used[i] || []);
+  if (state.focusRestore.static) {
+    state.staticQuestions = wrongIdx.map((i) => state.focusRestore.static[i]).filter(Boolean);
+  }
+  state.abortCtrl = new AbortController();
+  await beginRound();
+  toast("info", t("toast_focus_start", { qs: quizCountWord(state.activeParagraphs.length) }));
+}
+
+function backToSetup() {
+  stopTimer();
+  stopQuestionTimer(true);
+  if (state.abortCtrl) { try { state.abortCtrl.abort(); } catch {} }
+  updateSavedProgress();
+  restoreFullParagraphs();
+  state.quiz = null;
+  state.rendered = null;
+  state.regen = null;
+  state.staticQuestions = null;
+  state.importMeta = null;
+  clearSharedHash();
+  renderListsOverview();
+  renderResume();
+  renderHistory();
+  showScreen("setup");
+}
+
+function quitQuiz() {
+  if (!confirm(t("confirm_quit"))) return;
+  stopTimer();
+  stopQuestionTimer(true);
+  if (state.abortCtrl) { try { state.abortCtrl.abort(); } catch {} }
+  updateSavedProgress();
+  restoreFullParagraphs();
+  state.quiz = null;
+  state.rendered = null;
+  state.regen = null;
+  state.staticQuestions = null;
+  state.importMeta = null;
+  clearSharedHash();
+  renderListsOverview();
+  renderResume();
+  showScreen("setup");
+  toast("info", t("toast_quit"));
+}
+
+async function copyResults() {
+  if (!lastResults) return;
+  const { score, total, pct, elapsed, round, answers, bestStreak } = lastResults;
+  const lines = [];
+  const fastCount = answers.filter((a) => a.speedFast).length;
+  const lvl = getDifficulty();
+  lines.push(
+    t("copy_res_header", { score, total, pct, time: fmtDuration(elapsed), round }) +
+    (bestStreak ? t("copy_res_streak", { n: bestStreak }) : "") +
+    (lvl !== "medium" ? t("copy_res_level", { label: getDiffLabel(lvl) }) : "") +
+    (fastCount ? t("copy_res_speed", { n: fastCount }) : "") +
+    (lastResults.passagesViewed ? t("copy_res_passage", { n: lastResults.passagesViewed }) : "")
+  );
+  lines.push("");
+  answers.forEach((q, i) => {
+    lines.push(`${i + 1}. ${q.correct ? t("copy_res_correct") : t("copy_res_wrong")} ${q.question}`);
+    lines.push(t("copy_res_right_ans") + q.options[q.correctIndex]);
+    if (q.userNote && q.userNote.trim()) lines.push(t("copy_res_my_note") + q.userNote.trim());
+  });
+  const text = lines.join("\n");
+  await copyTextToClipboard(text, t("toast_copied_result"));
+}
+
+/* ====== حد عدد الفقرات ====== */
+function clampParagraphLimit(n) {
+  const v = parseInt(n, 10);
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(1, Math.min(100, v));
+}
+
+function getParagraphLimit() {
+  if (el("para-limit").value !== "custom") return 0;
+  return clampParagraphLimit(el("para-limit-custom").value);
+}
+
+function syncParaLimitUI() {
+  const custom = el("para-limit").value === "custom";
+  el("para-limit-custom-field").classList.toggle("hidden", !custom);
+}
+
+function loadParaLimit() {
+  try {
+    const raw = JSON.parse(store.get("quiz_para_limit") || "null");
+    if (raw && raw.mode === "custom") {
+      el("para-limit").value = "custom";
+      const c = clampParagraphLimit(raw.custom);
+      el("para-limit-custom").value = String(c || 10);
+    }
+  } catch {}
+}
+
+function saveParaLimit() {
+  const c = clampParagraphLimit(el("para-limit-custom").value) || 10;
+  store.set("quiz_para_limit", JSON.stringify({
+    mode: el("para-limit").value === "custom" ? "custom" : "all",
+    custom: c,
+  }));
+}
+
+/* ====== «الاختبار المعمق»: توسيع الفقرات إلى مدخلات (فقرة × فكرة أساسية) ====== */
+/* كل مدخل = سؤال واحد: فقرة عادية بلا أفكار تبقى مدخلًا واحدًا، وفقرة ذات أفكار تتوسع إلى مدخل لكل فكرة بترتيبها */
+function expandParagraphEntries(p, deep) {
+  const ideas = deep && p && Array.isArray(p.ideas) ? p.ideas.filter(Boolean) : [];
+  if (ideas.length <= 1) return [p];
+  return ideas.map((idea, ii) => ({
+    ...p,
+    idea,
+    ideaIndex: ii,
+    ideaCount: ideas.length,
+  }));
+}
+
+/* بناء مدخلات الجولة من فقرات التحليل — modeOverride لضمان اتساق الاستئناف مع الوضع المحفوظ */
+function buildActiveEntries(modeOverride) {
+  const mode = typeof modeOverride === "string" && KW_MODE_LABELS[modeOverride] ? modeOverride : getKwMode();
+  const deep = mode === "deep";
+  const paras = state.analysis && Array.isArray(state.analysis.paragraphs) ? state.analysis.paragraphs : [];
+  const out = [];
+  paras.forEach((p, pi) => {
+    expandParagraphEntries(p, deep).forEach((e) => {
+      if (!e || typeof e !== "object") return;
+      out.push({ ...e, baseIndex: pi });
+    });
+  });
+  return out;
+}
+
+function applyAnalysis(analysis, modeOverride) {
+  state.analysis = analysis;
+  state.activeParagraphs = buildActiveEntries(modeOverride);
+  state.usedKeywords = state.activeParagraphs.map(() => []);
+  state.roundPcts = [];
+  state.round = 0;
+  updateHeaderStudyBtn();
+}
+
+/* ====== استئناف آخر نص محفوظ ====== */
+const RESUME_KEY = "quiz_last_session";
+
+function saveLastSession() {
+  if (!state.analysis) return;
+  store.set(RESUME_KEY, JSON.stringify({
+    text: el("input-text").value.trim(),
+    analysis: state.analysis,
+    kwMode: getKwMode(),
+    savedAt: Date.now(),
+    progress: null,
+    savedRef: null,
+  }));
+}
+
+function loadLastSession() {
+  try {
+    const s = JSON.parse(store.get(RESUME_KEY) || "null");
+    if (s && s.analysis && Array.isArray(s.analysis.paragraphs) && s.analysis.paragraphs.length) return s;
+  } catch {}
+  return null;
+}
+
+function clearLastSession() {
+  store.del(RESUME_KEY);
+  renderResume();
+  updateHeaderStudyBtn();
+}
+
+function snapshotProgress() {
+  const qz = state.quiz;
+  if (!qz || qz.finished || state.focusRestore || state.staticQuestions || !state.analysis) return null;
+  const total = state.activeParagraphs.length;
+  if (!total) return null;
+  const resumeAt = qz.answers.length;
+  if (resumeAt < 0 || resumeAt >= total) return null;
+  if (!state.questions.has(resumeAt)) return null;
+  const questions = [];
+  state.questions.forEach((q, i) => questions.push({ i, q }));
+  if (!questions.length) return null;
+  return {
+    round: state.round,
+    roundPcts: state.roundPcts.slice(),
+    usedKeywords: state.usedKeywords.map((a) => a.slice()),
+    activeCount: total,
+    kwMode: getKwMode(),
+    resumeAt,
+    score: qz.score,
+    streak: qz.streak,
+    bestStreak: qz.bestStreak || 0,
+    speedBonus: qz.speedBonus || 0,
+    passagesViewed: qz.passagesViewed || 0,
+    elapsedMs: Math.max(0, Date.now() - qz.startedAt),
+    questions,
+    savedProgressAt: Date.now(),
+  };
+}
+
+function updateSavedProgress() {
+  if (!state.quiz) return;
+  const s = loadLastSession();
+  if (!s) return;
+  const snap = snapshotProgress();
+  if (snap) {
+    s.progress = snap;
+    s.savedAt = snap.savedProgressAt;
+  } else if (state.quiz.finished) {
+    s.progress = null;
+  } else {
+    return;
+  }
+  try { store.set(RESUME_KEY, JSON.stringify(s)); } catch {}
+  syncSavedItemProgress();
+}
+
+function validateProgress(s) {
+  const p = s && s.progress;
+  if (!p || typeof p !== "object") return null;
+  const paras = s.analysis && Array.isArray(s.analysis.paragraphs) ? s.analysis.paragraphs : null;
+  if (!paras || !paras.length) return null;
+  /* العدد المتوقع للأسئلة: في «الاختبار المعمق» مدخل لكل فكرة أساسية (بالوضع المحفوظ مع التقدم) */
+  const modeAtSave = (p && p.kwMode) || s.kwMode || "none";
+  const expected = modeAtSave === "deep" ? countDeepQuestions(paras) : paras.length;
+  if (p.activeCount !== expected) return null;
+  if (!Number.isInteger(p.resumeAt) || p.resumeAt < 0 || p.resumeAt >= expected) return null;
+  if (!Array.isArray(p.questions) || !p.questions.length) return null;
+  const seen = new Set();
+  for (const it of p.questions) {
+    const q = it && it.q;
+    if (!q || !Number.isInteger(it.i) || it.i < 0 || it.i >= expected || seen.has(it.i)) return null;
+    seen.add(it.i);
+    if (typeof q.question !== "string" || !Array.isArray(q.options) || q.options.length < 2) return null;
+    if (!Number.isInteger(q.correctIndex) || q.correctIndex < 0 || q.correctIndex >= q.options.length) return null;
+    if (!Number.isInteger(q.paragraphIndex) || q.paragraphIndex !== it.i) return null;
+  }
+  if (!seen.has(p.resumeAt)) return null;
+  if (!Array.isArray(p.usedKeywords) || p.usedKeywords.length !== expected) return null;
+  return p;
+}
+
+function renderResume() {
+  const s = loadLastSession();
+  const card = el("resume-card");
+  if (!s) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  el("resume-preview").textContent = (s.text || "").slice(0, 160) || "—";
+  /* في «الاختبار المعمق» اعرض عدد الأسئلة المتوقع بجانب عدد الفقرات */
+  const savedMode = s.kwMode || ((s.progress && s.progress.kwMode) || "none");
+  el("resume-count").textContent = savedMode === "deep"
+    ? t("resume_count_deep", { p: s.analysis.paragraphs.length, qs: quizCountWord(countDeepQuestions(s.analysis.paragraphs)) })
+    : paraCountWord(s.analysis.paragraphs.length);
+  try {
+    el("resume-date").textContent = new Date(s.savedAt).toLocaleString(getUiLocale(), { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  } catch { el("resume-date").textContent = ""; }
+  const prog = validateProgress(s);
+  const chip = el("resume-progress");
+  if (prog) {
+    chip.textContent = t("resume_progress_fmt", { cur: prog.resumeAt + 1, total: prog.activeCount, scorePart: prog.score ? t("resume_score_part", { score: prog.score }) : "" });
+    chip.classList.remove("hidden");
+  } else {
+    chip.classList.add("hidden");
+  }
+}
+
+async function resumeQuizRound(prog) {
+  state.abortCtrl = new AbortController();
+  state.rendered = null;
+  state.regen = null;
+  closePassageModal();
+  state.quiz = {
+    current: prog.resumeAt,
+    score: prog.score || 0,
+    streak: prog.streak || 0,
+    bestStreak: prog.bestStreak || 0,
+    answers: [],
+    startedAt: Date.now() - (prog.elapsedMs || 0),
+    timerId: null,
+    speedBonus: prog.speedBonus || 0,
+    qTimerId: null,
+    qDeadline: 0,
+    passagesViewed: prog.passagesViewed || 0,
+  };
+  state.pending.clear();
+  state.questions.clear();
+  (prog.questions || []).forEach(({ i, q }) => {
+    state.questions.set(i, q);
+    state.pending.set(i, Promise.resolve(q));
+    if (q.userAnswer !== null) state.quiz.answers.push(q);
+  });
+  setupRoundScreen();
+  if (state.quiz.streak >= 2) {
+    const chip = el("quiz-streak");
+    chip.querySelector("span").textContent = t("streak_chip", { n: state.quiz.streak });
+    chip.classList.remove("hidden");
+  }
+  updateQuizMeta();
+  startTimer();
+  await showCurrentQuestion();
+}
+
+async function resumeSession() {
+  const s = loadLastSession();
+  if (!s) return;
+  state.savedRef = s.savedRef && findSavedItem(s.savedRef) ? { listId: s.savedRef.listId, itemId: s.savedRef.itemId } : null;
+  const prog = validateProgress(s);
+  if (prog) {
+    state.staticQuestions = null;
+    state.importMeta = null;
+    /* وسّع الفقرات بالوضع المحفوظ مع التقدم ليتطابق ترقيم الأسئلة المحفوظة */
+    applyAnalysis(s.analysis, (prog && prog.kwMode) || s.kwMode);
+    state.usedKeywords = prog.usedKeywords.map((a) => (Array.isArray(a) ? a.slice() : []));
+    state.round = prog.round || 1;
+    state.roundPcts = Array.isArray(prog.roundPcts) ? prog.roundPcts.slice() : [];
+    el("input-text").value = s.text || "";
+    updateCharCount();
+    await resumeQuizRound(prog);
+    toast("success", t("toast_resumed_prog", { cur: prog.resumeAt + 1, total: state.activeParagraphs.length, score: state.quiz.score }));
+    return;
+  }
+  if (!el("api-key").value.trim()) {
+    toast("error", t("toast_need_key_resume"));
+    return;
+  }
+  state.staticQuestions = null;
+  state.importMeta = null;
+  applyAnalysis(s.analysis, s.kwMode);
+  el("input-text").value = s.text || "";
+  updateCharCount();
+  await beginRound();
+  toast("info", t("toast_resumed_fresh"));
+}
+
+/* =========================================================
+   تذكير الاستئناف الدوري — إشعارات PWA (v2.25 — الميزة مخفية مؤقتًا بالكامل، انظر REMINDER_FEATURE_ENABLED)
+   يعرض إشعارًا دوريًا لاستئناف آخر اختبار محفوظ، ويعمل ما دامت
+   نافذة التطبيق مفتوحة (حتى في الخلفية). الإعدادات في localStorage.
+   ========================================================= */
+/* ====== مفتاح الميزة الرئيسي (v2.25) ======
+   الميزة مخفية مؤقتًا بالكامل من واجهة التطبيق بسبب تعذّر نشر خادم Push.
+   اجعل القيمة true لإعادة إظهار الميزة وتشغيل خطط أ + ب + ج كما هي تمامًا،
+   ثم ضع رابط الخادم في PUSH_SERVER_URL أدناه إن كان جاهزًا. */
+const REMINDER_FEATURE_ENABLED = false;
+
+const REMINDER_KEY = "quiz_resume_reminder";
+const REMINDER_ICON = "./icons/icon-192.png";
+
+/* ====== الخطة ج: خادم Push خارجي (Cloudflare Worker — انظر push-server/README.md) ======
+   ضع رابط خادمك بعد نشره لتفعيل أقوى طبقة: الإشعار يصل حتى لو كان التطبيق والمتصفح
+   مغلقَين تماماً. بلا رابط يعمل التطبيق بالخطة أ + ب كما هو (تراجع سليم تلقائي). */
+const PUSH_SERVER_URL = "";
+const VAPID_PUBLIC_KEY = "BEIAjS_U52b5P8mm2Jdi4KR6lrPy8MKucpOKrIODYw7uLJOXC3YlH3bdpbGGTU7v1Q1er7V07TiV6lq6CG6b53k";
+const reminderSettings = { on: false, mins: 10, onlyUnfinished: true };
+let reminderTimerId = null;
+let reminderStatusTimerId = null;
+let reminderDueAt = 0;
+let reminderWaitingNote = false;
+
+function clampReminderMins(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return 10;
+  return Math.max(1, Math.min(1440, n));
+}
+
+function loadReminderSettings() {
+  try {
+    const raw = JSON.parse(store.get(REMINDER_KEY) || "null");
+    if (raw && typeof raw === "object") {
+      if (typeof raw.on === "boolean") reminderSettings.on = raw.on;
+      if (typeof raw.mins === "number" || typeof raw.mins === "string") reminderSettings.mins = clampReminderMins(raw.mins);
+      if (typeof raw.onlyUnfinished === "boolean") reminderSettings.onlyUnfinished = raw.onlyUnfinished;
+    }
+  } catch {}
+}
+
+function saveReminderSettings() {
+  store.set(REMINDER_KEY, JSON.stringify(reminderSettings));
+}
+
+function notificationsSupported() {
+  return "Notification" in window && "serviceWorker" in navigator;
+}
+
+function notificationsGranted() {
+  return notificationsSupported() && Notification.permission === "granted";
+}
+
+/* هل يوجد اختبار غير مكتمل يمكن استئنافه؟ (جولة نشطة محفوظة، أو اختبار في قائمة بتقدم جزئي) */
+function hasUnfinishedQuiz() {
+  const s = loadLastSession();
+  if (!s) return false;
+  if (s.progress) return true;
+  const item = findSavedItem(s.savedRef);
+  return !!(item && item.progress);
+}
+
+function stopReminderTimers() {
+  if (reminderTimerId) { clearInterval(reminderTimerId); reminderTimerId = null; }
+  if (reminderStatusTimerId) { clearInterval(reminderStatusTimerId); reminderStatusTimerId = null; }
+  reminderDueAt = 0;
+}
+
+function startReminderCycle() {
+  stopReminderTimers();
+  const interval = reminderSettings.mins * 60000;
+  /* إن بقي الموعد مستقبليًا (عودة من تعليق مؤقت) نُبقيه، وإلا نجددنه */
+  if (!reminderDueAt || reminderDueAt <= Date.now()) reminderDueAt = Date.now() + interval;
+  reminderWaitingNote = reminderSettings.onlyUnfinished && !hasUnfinishedQuiz();
+  /* خطة أ: نبضة كل 30 ثانية بدل مؤقّت طويل واحد — المؤقّتات الطويلة تُعلّق
+     أو تُبطّأ بشدة في الخلفية، والنبضة تتكيف مع التقييد وتلتقط الموعد الفائت */
+  reminderTimerId = setInterval(reminderHeartbeat, 30 * 1000);
+  reminderStatusTimerId = setInterval(updateReminderStatusLine, 1000);
+}
+
+/* نبضة الدورة: فحص فعلي للموعد بدل الاعتماد على دقة المؤقّت في الخلفية */
+function reminderHeartbeat() {
+  if (!REMINDER_FEATURE_ENABLED) return;
+  if (!reminderSettings.on || !notificationsGranted() || !reminderDueAt) return;
+  if (pushServerActive) {
+    /* خطة ج نشطة: الخادم هو المُشعِر — نبضة العميل تُقدّم موعد الخادم باستمرار
+       كي لا يرسل الخادم أثناء استخدام التطبيق، وتُجدّد العدّاد المحلي للعرض فقط */
+    if (Date.now() >= reminderDueAt) startReminderCycle();
+    syncPushSchedule();
+    return;
+  }
+  if (Date.now() < reminderDueAt) return;
+  fireDueReminder();
+}
+
+/* تشغيل/إيقاف الدورة بحسب الإعدادات والإذن — تُستدعى عند كل تغيير وعند فتح التطبيق */
+async function syncReminderCycle() {
+  if (!REMINDER_FEATURE_ENABLED) { stopReminderTimers(); return; }
+  if (reminderSettings.on && notificationsGranted()) startReminderCycle();
+  else stopReminderTimers();
+  await syncPushSchedule(true); /* خطة ج أولًا — إن نجحت تُلغى مشغّلات الخطة ب تلقائيًا */
+  syncReminderTriggers(true);
+  updateReminderStatusLine();
+}
+
+/* ====== خطة ب: جدولة الإشعارات القادمة عبر Notification Triggers (بدون أي خادم) ======
+   إن دعم المتصفح showTrigger/TimestampTrigger تُجدول الإشعارات مسبقًا في نظام
+   التشغيل فتصل حتى بعد إغلاق التطبيق/المتصفح (الأفضل عند التثبيت كـ PWA)،
+   وتُعاد الجدولة تلقائيًا عند كل فتح للصفحة. وإلا فالتراجع السليم إلى نبضة الخطة أ. */
+const TRIGGER_TAG_PREFIX = "quizme-notify-resume-s";
+const TRIGGER_MAX_COUNT = 24;
+const TRIGGER_MIN_MINS = 15; /* حد أدنى بين الإشعارات المجدولة كي لا نزحم النظام */
+let lastTriggerSyncAt = 0;
+
+function triggersSupported() {
+  return (
+    notificationsSupported() &&
+    typeof window.TimestampTrigger === "function" &&
+    typeof ServiceWorkerRegistration !== "undefined" &&
+    "showTrigger" in ServiceWorkerRegistration.prototype
+  );
+}
+
+async function getPendingTriggerNotifications() {
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (!reg || typeof reg.getNotifications !== "function") return [];
+    let list = [];
+    try { list = await reg.getNotifications({ includeTriggered: true }); }
+    catch { list = await reg.getNotifications(); }
+    return list.filter((n) => String(n.tag || "").startsWith(TRIGGER_TAG_PREFIX));
+  } catch { return []; }
+}
+
+async function cancelReminderTriggers() {
+  const list = await getPendingTriggerNotifications();
+  for (const n of list) { try { n.close(); } catch {} }
+}
+
+/* جدولة/إلغاء المشغّلات بحسب الإعدادات الحالية — الإلغاء فوري دائمًا، والجدولة مُقيّدة زمنيًا إلا عند force */
+async function syncReminderTriggers(force) {
+  if (!REMINDER_FEATURE_ENABLED) return false;
+  if (!triggersSupported()) return false;
+  if (pushServerActive) { await cancelReminderTriggers(); return false; } /* خطة ج نشطة — الخطة ب زائدة */
+  const active = reminderSettings.on && notificationsGranted() && (!reminderSettings.onlyUnfinished || hasUnfinishedQuiz());
+  if (!active) {
+    await cancelReminderTriggers();
+    return false;
+  }
+  const now = Date.now();
+  if (!force && now - lastTriggerSyncAt < 60000) return false;
+  lastTriggerSyncAt = now;
+  return scheduleReminderTriggers();
+}
+
+async function scheduleReminderTriggers() {
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (!reg || !reg.active || typeof reg.showNotification !== "function") return false;
+    await cancelReminderTriggers();
+    const mins = Math.max(TRIGGER_MIN_MINS, reminderSettings.mins);
+    const count = Math.min(TRIGGER_MAX_COUNT, Math.max(1, Math.ceil((24 * 60) / mins)));
+    const title = t("notif_title");
+    const body = t("notif_body");
+    const now = Date.now();
+    for (let i = 1; i <= count; i++) {
+      await reg.showNotification(title, {
+        body,
+        icon: REMINDER_ICON,
+        badge: REMINDER_ICON,
+        tag: TRIGGER_TAG_PREFIX + i,
+        data: { resume: 1 },
+        showTrigger: new TimestampTrigger(now + i * mins * 60000),
+      });
+    }
+    return true;
+  } catch { return false; }
+}
+
+/* ====== خطة ج: جدولة الإشعار عبر خادم Push خارجي (Web Push — RFC 8291/8292) ======
+   الخادم (Cloudflare Worker مجاني) يخزّن الاشتراك وموعد الإشعار ويرسله عبر خدمة
+   Push حتى لو كان التطبيق والمتصفح مغلقَين تماماً — أقوى طبقة، وتعمل أ + ب احتياطاً.
+   ما دام التطبيق مفتوحاً تبقى نبضات العميل تُقدّم موعد الخادم فلا يرسل أثناء الاستخدام. */
+const PUSH_CLIENT_ID_KEY = "quiz_push_client_id";
+let pushServerActive = false;
+let lastPushSyncAt = 0;
+
+function pushConfigured() {
+  return !!(PUSH_SERVER_URL && VAPID_PUBLIC_KEY && "serviceWorker" in navigator && "PushManager" in window);
+}
+
+function pushApiUrl(path) {
+  return PUSH_SERVER_URL.replace(/\/+$/, "") + path;
+}
+
+function pushClientId() {
+  let id = null;
+  try { id = store.get(PUSH_CLIENT_ID_KEY); } catch {}
+  if (!id) {
+    id = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : ("c" + Date.now() + "-" + Math.random().toString(36).slice(2, 12));
+    try { store.set(PUSH_CLIENT_ID_KEY, id); } catch {}
+  }
+  return id;
+}
+
+function urlBase64ToUint8Array(b64) {
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+/* الاشتراك الحالي أو إنشاؤه (يتطلب إذن إشعارات ممنوحًا مسبقًا) */
+async function getPushSubscription() {
+  const reg = await navigator.serviceWorker.getRegistration();
+  if (!reg || typeof reg.pushManager === "undefined") return null;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY) });
+  }
+  return sub;
+}
+
+/* مزامنة الجدولة مع الخادم — تُستدعى عند تغيير الإعدادات/فتح الصفحة/العودة من الخلفية/النبضة */
+async function syncPushSchedule(force) {
+  if (!REMINDER_FEATURE_ENABLED) return false;
+  if (!pushConfigured() || !notificationsSupported()) return false;
+  const now = Date.now();
+  if (!force && now - lastPushSyncAt < 25000) return pushServerActive;
+  lastPushSyncAt = now;
+  const active = reminderSettings.on && notificationsGranted() && (!reminderSettings.onlyUnfinished || hasUnfinishedQuiz());
+  if (!active) { cancelPushSchedule(); return false; }
+  try {
+    const sub = await getPushSubscription();
+    const subJson = sub && sub.toJSON ? sub.toJSON() : null;
+    if (!sub || !sub.endpoint || !subJson || !subJson.keys) return false;
+    const mins = reminderSettings.mins;
+    const dueAt = reminderDueAt && reminderDueAt > now ? reminderDueAt : now + mins * 60000;
+    const res = await fetch(pushApiUrl("/api/schedule"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        clientId: pushClientId(),
+        endpoint: sub.endpoint,
+        keys: subJson.keys,
+        dueAt: dueAt,
+        mins: mins,
+        onlyUnfinished: reminderSettings.onlyUnfinished,
+        lang: uiLang === "en" ? "en" : "ar",
+      }),
+    });
+    const wasActive = pushServerActive;
+    pushServerActive = !!(res && res.ok);
+    if (pushServerActive) cancelReminderTriggers(); /* الخطة ج تكفي — نمنع تكرار الخطة ب */
+    if (pushServerActive !== wasActive) updateReminderStatusLine();
+    return pushServerActive;
+  } catch (e) {
+    const wasActive = pushServerActive;
+    pushServerActive = false;
+    if (wasActive !== pushServerActive) updateReminderStatusLine();
+    try { console.warn("[اختبرني v2.25] تعذر الوصول لخادم Push — تراجع إلى الجدولة المحلية:", e && e.message); } catch {}
+    return false;
+  }
+}
+
+/* إلغاء جدولة الخادم (عند الإيقاف أو عدم وجود ما يُستأنف) */
+async function cancelPushSchedule() {
+  if (!pushConfigured()) return;
+  pushServerActive = false;
+  try {
+    await fetch(pushApiUrl("/api/cancel"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientId: pushClientId() }),
+    });
+  } catch {}
+}
+
+/* إشعار تجربة عبر الخادم — يثبت عمل السلسلة كاملة حتى مع التطبيق مغلقاً */
+async function pushTestNotification() {
+  if (!pushConfigured() || !notificationsSupported()) return false;
+  try {
+    const sub = await getPushSubscription();
+    if (!sub) return false;
+    const okSchedule = await syncPushSchedule(true);
+    if (!okSchedule) return false;
+    const res = await fetch(pushApiUrl("/api/test"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientId: pushClientId() }),
+    });
+    const data = res && res.ok ? await res.json().catch(() => null) : null;
+    return !!(data && data.ok);
+  } catch (e) {
+    try { console.warn("[اختبرني v2.25] فشل إشعار التجربة عبر الخادم:", e && e.message); } catch {}
+    return false;
+  }
+}
+
+function fireDueReminder() {
+  if (reminderSettings.on && notificationsGranted() && (!reminderSettings.onlyUnfinished || hasUnfinishedQuiz())) {
+    showResumeNotification(false);
+  }
+  if (reminderSettings.on && notificationsGranted()) startReminderCycle();
+  else stopReminderTimers();
+}
+
+/* إظهار الإشعار عبر Service Worker إن وجد، وإلا عبر Notification المباشر */
+async function showResumeNotification(isTest) {
+  if (!notificationsGranted()) return;
+  const title = isTest ? t("notif_test_title") : t("notif_title");
+  const body = isTest ? t("notif_test_body") : t("notif_body");
+  const opts = {
+    body,
+    icon: REMINDER_ICON,
+    badge: REMINDER_ICON,
+    tag: isTest ? "quizme-notify-test" : "quizme-notify-resume",
+  };
+  try {
+    if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg && typeof reg.showNotification === "function") {
+        reg.showNotification(title, opts);
+        return;
+      }
+    }
+    if (notificationsSupported() && Notification.permission === "granted") {
+      const n = new Notification(title, opts);
+      n.onclick = () => {
+        n.close();
+        try { window.focus(); } catch {}
+        resumeFromReminder();
+      };
+    }
+  } catch {}
+}
+
+/* استئناف من الإشعار: رسالة ودية إن لم يوجد اختبار محفوظ */
+async function resumeFromReminder() {
+  const s = loadLastSession();
+  if (!s) {
+    toast("info", t("toast_resume_none"));
+    return;
+  }
+  await resumeSession();
+}
+
+async function requestNotificationPermission() {
+  if (!notificationsSupported()) return "unsupported";
+  if (Notification.permission === "default") {
+    try { return await Notification.requestPermission(); } catch { return "denied"; }
+  }
+  return Notification.permission;
+}
+
+async function onReminderToggle() {
+  if (reminderSettings.on) {
+    reminderSettings.on = false;
+    saveReminderSettings();
+    syncReminderUI();
+    syncReminderCycle();
+    toast("info", t("toast_reminder_off"));
+    return;
+  }
+  if (!notificationsSupported()) {
+    toast("error", t("toast_reminder_unsupported"));
+    updateReminderStatusLine();
+    return;
+  }
+  const perm = await requestNotificationPermission();
+  if (perm !== "granted") {
+    reminderSettings.on = false;
+    saveReminderSettings();
+    syncReminderUI();
+    syncReminderCycle();
+    toast("error", t("toast_reminder_denied"));
+    updateReminderStatusLine();
+    return;
+  }
+  reminderSettings.on = true;
+  saveReminderSettings();
+  syncReminderUI();
+  await syncReminderCycle();
+  toast("success", t("toast_reminder_on", { mins: reminderSettings.mins }));
+  if (pushServerActive) toast("info", t("toast_push_active"));
+  else if (triggersSupported()) toast("info", t("toast_reminder_scheduled"));
+}
+
+function onReminderIntervalChange() {
+  if (el("reminder-interval").value === "custom") {
+    el("reminder-custom-field").classList.remove("hidden");
+    el("reminder-custom").value = String(reminderSettings.mins);
+    return;
+  }
+  el("reminder-custom-field").classList.add("hidden");
+  reminderSettings.mins = clampReminderMins(el("reminder-interval").value);
+  saveReminderSettings();
+  syncReminderCycle();
+  if (reminderSettings.on && notificationsGranted()) {
+    toast("info", t("toast_reminder_on", { mins: reminderSettings.mins }));
+  }
+}
+
+function onReminderCustomChange() {
+  const clamped = clampReminderMins(el("reminder-custom").value);
+  el("reminder-custom").value = String(clamped);
+  reminderSettings.mins = clamped;
+  saveReminderSettings();
+  syncReminderCycle();
+  if (reminderSettings.on && notificationsGranted()) {
+    toast("info", t("toast_reminder_on", { mins: reminderSettings.mins }));
+  }
+}
+
+async function testReminderNotification() {
+  if (!notificationsSupported()) {
+    toast("error", t("toast_reminder_unsupported"));
+    updateReminderStatusLine();
+    return;
+  }
+  const perm = await requestNotificationPermission();
+  if (perm !== "granted") {
+    toast("error", t("toast_reminder_denied"));
+    updateReminderStatusLine();
+    return;
+  }
+  /* خطة ج: عند ضبط الخادم نجرّب السلسلة كاملة عبره — إن نجحت فهي أقوى إثبات، وإلا تجربة محلية */
+  if (pushConfigured()) {
+    const okPush = await pushTestNotification();
+    if (okPush) {
+      toast("success", t("toast_push_test_sent"));
+      updateReminderStatusLine();
+      return;
+    }
+  }
+  await showResumeNotification(true);
+  toast("success", t("toast_reminder_test_sent"));
+  updateReminderStatusLine();
+}
+
+function fmtReminderCountdown(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  return Math.floor(total / 60) + ":" + String(total % 60).padStart(2, "0");
+}
+
+function updateReminderStatusLine() {
+  const box = el("reminder-status");
+  if (!box) return;
+  let dot = "off";
+  const parts = [];
+  if (!reminderSettings.on) {
+    parts.push(t("reminder_status_off"));
+  } else if (!notificationsSupported()) {
+    parts.push(t("reminder_status_unsupported"));
+  } else if (Notification.permission === "denied") {
+    dot = "bad";
+    parts.push(t("reminder_status_denied"));
+  } else if (Notification.permission === "default") {
+    dot = "warn";
+    parts.push(t("reminder_status_default"));
+  } else if (reminderDueAt) {
+    dot = "ok";
+    parts.push(t("reminder_status_next", { time: fmtReminderCountdown(reminderDueAt - Date.now()) }));
+    if (reminderWaitingNote) parts.push(t("reminder_status_waiting"));
+    parts.push(pushServerActive ? t("reminder_push_ok") : triggersSupported() ? t("reminder_triggers_ok") : t("reminder_note"));
+  } else {
+    dot = "warn";
+    parts.push(t("reminder_status_default"));
+  }
+  box.innerHTML = '<span class="reminder-dot ' + dot + '" aria-hidden="true"></span><span>' + escHtml(parts.join(" ")) + "</span>";
+}
+
+function syncReminderUI() {
+  el("reminder-box").classList.toggle("hidden", !REMINDER_FEATURE_ENABLED);
+  const tg = el("reminder-toggle");
+  tg.setAttribute("aria-checked", String(reminderSettings.on));
+  tg.classList.toggle("is-on", reminderSettings.on);
+  el("reminder-box").classList.toggle("is-off", !reminderSettings.on);
+  const v = String(reminderSettings.mins);
+  const sel = el("reminder-interval");
+  const known = [...sel.options].some((o) => o.value === v);
+  if (known) {
+    sel.value = v;
+    el("reminder-custom-field").classList.add("hidden");
+  } else {
+    sel.value = "custom";
+    el("reminder-custom").value = v;
+    el("reminder-custom-field").classList.remove("hidden");
+  }
+  el("reminder-unfinished").checked = reminderSettings.onlyUnfinished;
+  updateReminderStatusLine();
+}
+
+/* ====== نافذة دليل الدراسة الشامل (Study Guide Modal) ====== */
+/* ====== v2.25: تنظيف الإخفاء ======
+   إيقاف المؤقتات، إخفاء الصندوق، إلغاء الجدولة لدى الخادم (إن ضُبط)،
+   إلغاء مشغّلات الخطة ب المجدولة سابقًا، وإلغاء اشتراك Push المحلي إن وجد.
+   تُستدعى مرة عند كل فتح للتطبيق ما دامت الميزة مخفية. */
+async function hideReminderFeature() {
+  reminderSettings.on = false;
+  stopReminderTimers();
+  syncReminderUI();
+  await cancelPushSchedule();
+  await cancelReminderTriggers();
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (reg && reg.pushManager) {
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) { try { await sub.unsubscribe(); } catch {} }
+    }
+  } catch {}
+}
+
+let studyGuideReturnFocus = null;
+
+function isStudyGuideOpen() {
+  return !el("study-guide-overlay").classList.contains("hidden");
+}
+
+function getActiveAnalysisForStudy() {
+  if (state.analysis && Array.isArray(state.analysis.paragraphs) && state.analysis.paragraphs.length) {
+    return state.analysis;
+  }
+  const last = loadLastSession();
+  if (last && last.analysis && Array.isArray(last.analysis.paragraphs) && last.analysis.paragraphs.length) {
+    return last.analysis;
+  }
+  return null;
+}
+
+function openStudyGuideModal() {
+  const analysis = getActiveAnalysisForStudy();
+  if (!analysis) {
+    toast("info", t("toast_no_study_guide"));
+    return;
+  }
+  const sgCtx = el("sg-context");
+  sgCtx.innerHTML = "";
+  sgCtx.appendChild(mathRichFrag(analysis.context || "—"));
+
+  const kwBox = el("sg-keywords");
+  kwBox.innerHTML = "";
+  const allKws = [...new Set(analysis.paragraphs.flatMap((p) => p.keywords || []).filter(Boolean))];
+  el("sg-keywords-section").classList.toggle("hidden", !allKws.length);
+  allKws.forEach((kw) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "sg-kw-chip";
+    chip.textContent = kw;
+    chip.title = t("sg_kw_chip_title");
+    chip.addEventListener("click", () => {
+      el("sg-search").value = kw;
+      renderStudyGuideParagraphs(analysis);
+    });
+    kwBox.appendChild(chip);
+  });
+
+  el("sg-search").value = "";
+  renderStudyGuideParagraphs(analysis);
+
+  studyGuideReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  el("study-guide-overlay").classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+}
+
+function renderStudyGuideParagraphs(analysis) {
+  const a = analysis || getActiveAnalysisForStudy();
+  const wrap = el("sg-paragraphs");
+  if (!wrap || !a) return;
+  wrap.innerHTML = "";
+  const q = String(el("sg-search").value || "").trim().toLowerCase();
+
+  /* «الاختبار المعمق»: عدة أسئلة لكل فقرة — اجمع ملاحظات كل فقرة من مدخلاتها عبر baseIndex */
+  const notesByPara = new Map();
+  if (state.questions && state.questions.size) {
+    state.questions.forEach((qObj) => {
+      if (!qObj || !qObj.userNote || !qObj.userNote.trim() || !Number.isInteger(qObj.paragraphIndex)) return;
+      const entry = state.activeParagraphs && state.activeParagraphs[qObj.paragraphIndex];
+      const base = entry && Number.isInteger(entry.baseIndex) ? entry.baseIndex : qObj.paragraphIndex;
+      if (!notesByPara.has(base)) notesByPara.set(base, []);
+      notesByPara.get(base).push(qObj.userNote.trim());
+    });
+  }
+
+  a.paragraphs.forEach((p, idx) => {
+    const notes = notesByPara.get(idx) || [];
+    const note = notes.join(" — ");
+    const hay = [p.text, ...(p.keywords || []), ...(p.ideas || []), note].join(" ").toLowerCase();
+    if (q && !hay.includes(q)) return;
+
+    const card = document.createElement("div");
+    card.className = "sg-para-card";
+
+    const head = document.createElement("div");
+    head.className = "sg-para-head";
+    const num = document.createElement("span");
+    num.className = "sg-para-num";
+    num.textContent = t("sg_para_num", { n: idx + 1 }) + (Array.isArray(p.ideas) && p.ideas.length > 1 ? t("sg_para_ideas_count", { n: p.ideas.length }) : "");
+    head.appendChild(num);
+
+    const kws = document.createElement("div");
+    kws.style.display = "flex";
+    kws.style.gap = "5px";
+    kws.style.flexWrap = "wrap";
+    (p.keywords || []).forEach((k) => {
+      const sp = document.createElement("span");
+      sp.className = "chip";
+      sp.style.fontSize = "0.7rem";
+      sp.style.padding = "2px 9px";
+      sp.textContent = k;
+      kws.appendChild(sp);
+    });
+    head.appendChild(kws);
+
+    const ttsBtn = document.createElement("button");
+    ttsBtn.type = "button";
+    ttsBtn.className = "btn ghost sm";
+    ttsBtn.style.padding = "4px 10px";
+    ttsBtn.style.minHeight = "30px";
+    ttsBtn.textContent = t("sg_listen_btn");
+    ttsBtn.addEventListener("click", () => speakText(p.text, ttsBtn));
+    head.appendChild(ttsBtn);
+
+    const body = document.createElement("div");
+    body.className = "sg-para-text";
+    body.dir = "auto";
+    body.appendChild(passageRichFrag(p.text, ""));
+
+    card.appendChild(head);
+    card.appendChild(body);
+
+    /* «الاختبار المعمق»: أظهر الأفكار الأساسية المستخرجة للفقرة */
+    if (Array.isArray(p.ideas) && p.ideas.length) {
+      const ideasBox = document.createElement("div");
+      ideasBox.className = "sg-para-ideas";
+      ideasBox.dir = "auto";
+      const lbl = document.createElement("span");
+      lbl.className = "sg-ideas-label";
+      lbl.textContent = t("sg_ideas_heading");
+      ideasBox.appendChild(lbl);
+      const list = document.createElement("ol");
+      list.className = "sg-ideas-list";
+      p.ideas.forEach((idea) => {
+        const li = document.createElement("li");
+        li.textContent = idea;
+        list.appendChild(li);
+      });
+      ideasBox.appendChild(list);
+      card.appendChild(ideasBox);
+    }
+
+    if (note) {
+      const nEl = document.createElement("div");
+      nEl.className = "review-user-note";
+      nEl.dir = "auto";
+      nEl.textContent = t("review_note") + note;
+      card.appendChild(nEl);
+    }
+    wrap.appendChild(card);
+  });
+}
+
+function closeStudyGuideModal() {
+  const ov = el("study-guide-overlay");
+  if (ov.classList.contains("hidden")) return;
+  stopSpeech();
+  ov.classList.add("hidden");
+  document.body.style.overflow = "";
+  if (studyGuideReturnFocus && document.contains(studyGuideReturnFocus)) {
+    try { studyGuideReturnFocus.focus(); } catch {}
+  }
+  studyGuideReturnFocus = null;
+}
+
+async function copyStudyGuide() {
+  const a = getActiveAnalysisForStudy();
+  if (!a) return;
+  const lines = [];
+  lines.push(t("sg_copy_title"));
+  lines.push("================================");
+  lines.push(t("sg_copy_context") + (a.context || "—"));
+  lines.push("");
+  a.paragraphs.forEach((p, idx) => {
+    lines.push(t("sg_copy_para", { n: idx + 1 }));
+    if (p.keywords && p.keywords.length) lines.push(t("sg_copy_kws") + p.keywords.join(" · "));
+    if (Array.isArray(p.ideas) && p.ideas.length) {
+      lines.push(t("sg_copy_ideas"));
+      p.ideas.forEach((idea, ii) => lines.push(`${ii + 1}. ${idea}`));
+    }
+    lines.push(p.text);
+    /* «الاختبار المعمق»: اجمع ملاحظات كل فقرة من مدخلاتها عبر baseIndex */
+    const notes = [];
+    if (state.questions && state.questions.size) {
+      state.questions.forEach((qObj) => {
+        if (!qObj || !qObj.userNote || !qObj.userNote.trim() || !Number.isInteger(qObj.paragraphIndex)) return;
+        const entry = state.activeParagraphs && state.activeParagraphs[qObj.paragraphIndex];
+        const base = entry && Number.isInteger(entry.baseIndex) ? entry.baseIndex : qObj.paragraphIndex;
+        if (base === idx) notes.push(qObj.userNote.trim());
+      });
+    }
+    if (notes.length) lines.push(t("sg_copy_notes") + notes.join(" — "));
+    lines.push("");
+  });
+  await copyTextToClipboard(lines.join("\n"), t("toast_sg_copied"));
+}
+
+/* ====== نافذة اختصارات لوحة المفاتيح ====== */
+let shortcutsReturnFocus = null;
+function openShortcutsModal() {
+  if (isOverlayVisibleById("shortcuts-overlay")) return;
+  shortcutsReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  el("shortcuts-overlay").classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+  try { el("btn-shortcuts-ok").focus(); } catch {}
+}
+function closeShortcutsModal() {
+  const ov = el("shortcuts-overlay");
+  if (ov.classList.contains("hidden")) return;
+  ov.classList.add("hidden");
+  document.body.style.overflow = "";
+  if (shortcutsReturnFocus && document.contains(shortcutsReturnFocus)) {
+    try { shortcutsReturnFocus.focus(); } catch {}
+  }
+  shortcutsReturnFocus = null;
+}
+
+/* ====== تصدير الاختبار ====== */
+function downloadFile(name, content, type) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function exportJson() {
+  if (!lastResults) return;
+  const data = {
+    app: "اختبرني",
+    version: "2.0",
+    exportedAt: new Date().toISOString(),
+    context: state.analysis ? state.analysis.context : "",
+    score: lastResults.score,
+    total: lastResults.total,
+    questions: lastResults.answers.map((q, i) => ({
+      n: i + 1,
+      qType: q.qType || "mcq",
+      keyword: q.keyword,
+      question: q.question,
+      options: q.options,
+      correctAnswer: q.options[q.correctIndex],
+      explanation: q.explanation,
+      yourAnswer: q.userAnswer !== null && q.userAnswer >= 0 ? q.options[q.userAnswer] : null,
+      wasCorrect: !!q.correct,
+      starred: !!q.starred,
+      userNote: q.userNote || "",
+    })),
+  };
+  downloadFile("ihtibarani-quiz-" + Date.now() + ".json", JSON.stringify(data, null, 2), "application/json;charset=utf-8");
+  toast("success", t("toast_json_exported"));
+}
+
+function exportText() {
+  if (!lastResults) return;
+  const letters = isEn() ? ["A", "B", "C", "D"] : ["أ", "ب", "ج", "د"];
+  const { score, total, pct, round, answers } = lastResults;
+  const lines = [];
+  lines.push(t("txt_export_header"));
+  lines.push(t("txt_export_date") + new Date().toLocaleString(getUiLocale()));
+  if (state.analysis) lines.push(t("sg_copy_context") + state.analysis.context);
+  lines.push(t("txt_export_result", { score, total, pct, round }));
+  lines.push("");
+  lines.push(t("txt_export_questions"));
+  answers.forEach((q, i) => {
+    lines.push("");
+    lines.push(`${i + 1}) ${q.question}`);
+    q.options.forEach((o, oi) => lines.push(`   ${letters[oi] || (oi + 1)}) ${o}`));
+  });
+  lines.push("");
+  lines.push(t("txt_export_answers"));
+  answers.forEach((q, i) => {
+    lines.push(`${i + 1}) ${q.options[q.correctIndex]}`);
+    if (q.explanation) lines.push(t("txt_export_explain") + q.explanation);
+    if (q.userNote && q.userNote.trim()) lines.push(t("copy_res_my_note") + q.userNote.trim());
+  });
+  downloadFile("ihtibarani-quiz-" + Date.now() + ".txt", lines.join("\n"), "text/plain;charset=utf-8");
+  toast("success", t("toast_txt_exported"));
+}
+
+/* ====== قوائم حفظ الاختبارات (localStorage) ====== */
+const LISTS_KEY = "quiz_lists_v1";
+const LAST_LIST_KEY = "quiz_save_list";
+const MAX_LISTS = 10;
+const MAX_ITEMS = 15;
+const DEFAULT_LIST_NAME = "قائمة الحفظ";
+
+function uid(prefix) {
+  return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+function loadLists() {
+  let ls = null;
+  try { ls = JSON.parse(store.get(LISTS_KEY) || "null"); } catch {}
+  if (ls && Array.isArray(ls.lists) && ls.lists.length) {
+    ls.lists.forEach((l) => { if (!Array.isArray(l.items)) l.items = []; });
+    if (!ls.lists.some((l) => l.id === "default")) {
+      ls.lists.unshift({ id: "default", name: DEFAULT_LIST_NAME, builtin: true, createdAt: Date.now(), items: [] });
+    }
+    if (!findList(ls, ls.activeListId)) ls.activeListId = "default";
+    return ls;
+  }
+  ls = { v: 1, activeListId: "default", lists: [{ id: "default", name: DEFAULT_LIST_NAME, builtin: true, createdAt: Date.now(), items: [] }] };
+  try {
+    const old = JSON.parse(store.get("quiz_library") || "[]");
+    (Array.isArray(old) ? old : []).forEach((it) => {
+      if (!it || !Array.isArray(it.questions) || !it.questions.length) return;
+      ls.lists[0].items.push({
+        id: String(it.id || uid("i")),
+        name: String(it.name || t("saved_quiz_fallback")),
+        createdAt: it.savedAt || Date.now(),
+        updatedAt: it.savedAt || Date.now(),
+        source: "legacy",
+        text: "", analysis: null, progress: null,
+        questions: it.questions,
+        ctx: String(it.ctx || ""),
+        plays: it.plays || 0,
+        bestPct: it.bestPct || 0,
+        lastPct: null,
+      });
+    });
+  } catch {}
+  saveLists(ls);
+  return ls;
+}
+
+function saveLists(ls) {
+  store.set(LISTS_KEY, JSON.stringify(ls));
+}
+
+function findList(ls, id) {
+  return ls && Array.isArray(ls.lists) ? ls.lists.find((l) => l.id === id) || null : null;
+}
+
+function findSavedItem(ref) {
+  if (!ref || !ref.listId || !ref.itemId) return null;
+  const list = findList(loadLists(), ref.listId);
+  return list ? list.items.find((x) => x.id === itemIdFromRef(ref)) || null : null;
+}
+
+function itemIdFromRef(ref) {
+  return ref ? ref.itemId : null;
+}
+
+function withItem(listId, itemId, fn) {
+  const ls = loadLists();
+  const list = findList(ls, listId);
+  if (!list) return false;
+  const idx = list.items.findIndex((x) => x.id === itemId);
+  if (idx < 0) return false;
+  fn(list.items[idx], list, idx);
+  saveLists(ls);
+  return true;
+}
+
+function firstParaSig(analysis) {
+  const p = analysis && Array.isArray(analysis.paragraphs) ? analysis.paragraphs[0] : null;
+  return p && p.text ? String(p.text).slice(0, 80) : "";
+}
+
+function deriveSessionName() {
+  if (state.importMeta && state.importMeta.name) return state.importMeta.name;
+  return el("input-text").value.trim().slice(0, 42) || t("saved_quiz_fallback");
+}
+
+function fmtShortDate(ts) {
+  try { return new Date(ts).toLocaleDateString(getUiLocale(), { day: "numeric", month: "short", year: "numeric" }); } catch { return ""; }
+}
+
+function buildItemFromCurrent(name) {
+  const now = Date.now();
+  if (state.staticQuestions) {
+    return {
+      id: uid("i"), name, createdAt: now, updatedAt: now, source: "legacy",
+      text: "", analysis: null, progress: null,
+      questions: state.staticQuestions.map((q) => ({
+        keyword: q.keyword || "", question: q.question, options: [...q.options],
+        correctIndex: q.correctIndex, explanation: q.explanation || "",
+      })),
+      ctx: state.analysis ? state.analysis.context : "",
+      plays: 0, bestPct: 0, lastPct: null,
+    };
+  }
+  return {
+    id: uid("i"), name, createdAt: now, updatedAt: now, source: "session",
+    text: el("input-text").value.trim(),
+    analysis: state.analysis,
+    kwMode: getKwMode(),
+    progress: snapshotProgress(),
+    questions: null, ctx: "",
+    plays: 0, bestPct: 0, lastPct: null,
+  };
+}
+
+function syncSavedItemProgress() {
+  if (!state.savedRef || !state.quiz) return;
+  const snap = snapshotProgress();
+  withItem(state.savedRef.listId, state.savedRef.itemId, (it) => {
+    if (snap) {
+      it.progress = snap;
+      it.updatedAt = snap.savedProgressAt;
+    } else if (state.quiz.finished && !state.focusRestore) {
+      it.progress = null;
+    }
+  });
+}
+
+function patchResumeSavedRef(ref) {
+  const s = loadLastSession();
+  if (!s) return;
+  s.savedRef = ref || null;
+  try { store.set(RESUME_KEY, JSON.stringify(s)); } catch {}
+}
+
+function flashSaveButton() {
+  const btn = el("btn-save-library");
+  if (!btn) return;
+  btn.classList.add("saved-flash");
+  const label = btn.querySelector(".save-label");
+  if (label) {
+    const old = label.textContent;
+    label.textContent = t("btn_saved_in_list");
+    setTimeout(() => { label.textContent = old; btn.classList.remove("saved-flash"); }, 2200);
+  } else {
+    setTimeout(() => btn.classList.remove("saved-flash"), 2200);
+  }
+}
+
+/* ====== نافذة الحفظ في قائمة ====== */
+let saveModalCtx = { mode: "results" };
+let saveModalReturnFocus = null;
+
+function isSaveListOpen() {
+  return !el("save-list-overlay").classList.contains("hidden");
+}
+
+function openSaveToListModal(mode) {
+  if (isSaveListOpen()) return;
+  if (mode === "last-session") {
+    if (!loadLastSession()) { toast("error", t("toast_no_saved_to_move")); return; }
+  } else if (!state.analysis && !state.staticQuestions) {
+    toast("error", t("toast_no_quiz_to_save"));
+    return;
+  }
+  saveModalCtx = { mode };
+  el("save-list-title-text").textContent = mode === "last-session" ? t("save_list_title_move") : t("save_list_title");
+  el("btn-save-list-confirm").textContent = mode === "last-session" ? t("btn_save_list_move") : t("btn_save_list_confirm");
+  let prefill = "";
+  if (state.savedRef) {
+    const cur = findSavedItem(state.savedRef);
+    if (cur) prefill = cur.name || "";
+  }
+  if (!prefill) {
+    prefill = mode === "last-session"
+      ? ((loadLastSession().text || "").trim().slice(0, 42) || t("saved_quiz_fallback"))
+      : deriveSessionName();
+  }
+  el("save-list-name").value = prefill;
+  el("save-list-new-name").value = "";
+  el("save-list-new-field").classList.add("hidden");
+  renderSaveListOptions();
+  saveModalReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  el("save-list-overlay").classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+  try { el("save-list-name").focus(); el("save-list-name").select(); } catch {}
+}
+
+function closeSaveToListModal() {
+  const ov = el("save-list-overlay");
+  if (ov.classList.contains("hidden")) return;
+  ov.classList.add("hidden");
+  document.body.style.overflow = "";
+  if (saveModalReturnFocus && document.contains(saveModalReturnFocus)) {
+    try { saveModalReturnFocus.focus(); } catch {}
+  }
+  saveModalReturnFocus = null;
+}
+
+function renderSaveListOptions() {
+  const ls = loadLists();
+  const wrap = el("save-list-options");
+  wrap.innerHTML = "";
+  const lastUsed = store.get(LAST_LIST_KEY);
+  const prechecked = state.savedRef && findSavedItem(state.savedRef)
+    ? state.savedRef.listId
+    : (findList(ls, lastUsed) ? lastUsed : "default");
+  ls.lists.forEach((l) => {
+    const row = document.createElement("label");
+    row.className = "list-pick-row";
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = "save-list-choice";
+    input.value = l.id;
+    input.checked = l.id === prechecked;
+    input.addEventListener("change", () => el("save-list-new-field").classList.add("hidden"));
+    const nm = document.createElement("span");
+    nm.className = "lpr-name";
+    nm.textContent = getDefaultListDisplayName(l);
+    const ct = document.createElement("span");
+    ct.className = "lpr-count";
+    ct.textContent = String(l.items.length);
+    row.appendChild(input);
+    row.appendChild(nm);
+    row.appendChild(ct);
+    if (l.builtin) {
+      const badge = document.createElement("span");
+      badge.className = "lpr-badge";
+      badge.textContent = t("badge_default");
+      row.appendChild(badge);
+    }
+    wrap.appendChild(row);
+  });
+  const newRow = document.createElement("label");
+  newRow.className = "list-pick-row new";
+  const ninput = document.createElement("input");
+  ninput.type = "radio";
+  ninput.name = "save-list-choice";
+  ninput.value = "__new__";
+  const nnm = document.createElement("span");
+  nnm.className = "lpr-name";
+  nnm.textContent = t("new_list_opt");
+  newRow.appendChild(ninput);
+  newRow.appendChild(nnm);
+  ninput.addEventListener("change", () => {
+    el("save-list-new-field").classList.remove("hidden");
+    try { el("save-list-new-name").focus(); } catch {}
+  });
+  wrap.appendChild(newRow);
+}
+
+function confirmSaveToList() {
+  const choiceEl = document.querySelector('input[name="save-list-choice"]:checked');
+  if (!choiceEl) { toast("error", t("toast_pick_list")); return; }
+  const choice = choiceEl.value;
+  let targetId;
+  if (choice === "__new__") {
+    const nm = el("save-list-new-name").value.trim().slice(0, 40);
+    if (!nm) { toast("error", t("toast_enter_new_list_name")); try { el("save-list-new-name").focus(); } catch {} return; }
+    const ls0 = loadLists();
+    if (ls0.lists.length >= MAX_LISTS) { toast("error", t("toast_max_lists", { max: MAX_LISTS })); return; }
+    if (ls0.lists.some((l) => l.name === nm)) { toast("error", t("toast_list_exists")); return; }
+    targetId = uid("l");
+    ls0.lists.push({ id: targetId, name: nm, createdAt: Date.now(), items: [] });
+    saveLists(ls0);
+  } else {
+    targetId = choice;
+  }
+
+  const ls = loadLists();
+  const targetList = findList(ls, targetId);
+  if (!targetList) { toast("error", t("toast_list_not_found")); return; }
+  const name = el("save-list-name").value.trim().slice(0, 80) || deriveSessionName();
+
+  let item = null;
+  if (state.savedRef) {
+    for (const l of ls.lists) {
+      const idx = l.items.findIndex((x) => x.id === state.savedRef.itemId);
+      if (idx >= 0) {
+        item = l.items[idx];
+        if (l.id !== targetList.id) {
+          l.items.splice(idx, 1);
+          targetList.items.unshift(item);
+        }
+        break;
+      }
+    }
+  }
+
+  if (saveModalCtx.mode === "last-session") {
+    const s = loadLastSession();
+    if (!s) { toast("error", t("toast_no_saved_to_move")); return; }
+    if (!item) {
+      const sig = firstParaSig(s.analysis);
+      item = targetList.items.find((x) => x.source === "session" && x.name === name && firstParaSig(x.analysis) === sig) || null;
+      if (!item) {
+        if (targetList.items.length >= MAX_ITEMS) {
+          toast("error", t("toast_list_full", { name: getDefaultListDisplayName(targetList), max: MAX_ITEMS }));
+          return;
+        }
+        item = { id: uid("i"), createdAt: Date.now(), plays: 0, bestPct: 0, lastPct: null, source: "session", questions: null, ctx: "" };
+        targetList.items.unshift(item);
+      }
+    }
+    item.text = s.text || "";
+    item.analysis = s.analysis;
+    item.progress = s.progress || null;
+  } else {
+    const built = buildItemFromCurrent(name);
+    if (!item) {
+      const sig = built.source === "session"
+        ? firstParaSig(built.analysis)
+        : (built.questions && built.questions[0] ? built.questions[0].question : "");
+      item = targetList.items.find((x) => x.name === name && x.source === built.source
+        && ((x.source === "session" ? firstParaSig(x.analysis) : (x.questions && x.questions[0] ? x.questions[0].question : "")) === sig)) || null;
+      if (!item) {
+        if (targetList.items.length >= MAX_ITEMS) {
+          toast("error", t("toast_list_full", { name: getDefaultListDisplayName(targetList), max: MAX_ITEMS }));
+          return;
+        }
+        targetList.items.unshift(built);
+        item = built;
+      }
+    }
+    item.text = built.text;
+    item.analysis = built.analysis;
+    item.progress = built.progress;
+    item.questions = built.questions;
+    item.ctx = built.ctx;
+    item.source = built.source;
+  }
+  item.name = name;
+  item.updatedAt = Date.now();
+  state.savedRef = { listId: targetList.id, itemId: item.id };
+  store.set(LAST_LIST_KEY, targetList.id);
+  saveLists(ls);
+
+  if (saveModalCtx.mode === "last-session") {
+    state.savedRef = null;
+    clearLastSession();
+    closeSaveToListModal();
+    renderListsOverview();
+    toast("success", t("toast_moved_last_session", { name: getDefaultListDisplayName(targetList) }));
+    return;
+  }
+  patchResumeSavedRef(state.savedRef);
+  closeSaveToListModal();
+  renderListsOverview();
+  if (el("screen-lists").classList.contains("active")) renderListsScreen();
+  flashSaveButton();
+  toast("success", t("toast_saved_to_list", { item: name, list: getDefaultListDisplayName(targetList), progPart: item.progress ? t("toast_saved_prog_part") : "" }));
+}
+
+/* ====== فتح/استئناف اختبار من القوائم ====== */
+async function openLibraryItem(listId, itemId) {
+  const list = findList(loadLists(), listId);
+  const it = list ? list.items.find((x) => x.id === itemId) : null;
+  if (!it) return;
+  if (it.source === "legacy") {
+    playLegacyItem(listId, it);
+    return;
+  }
+  if (!it.analysis || !Array.isArray(it.analysis.paragraphs) || !it.analysis.paragraphs.length) {
+    toast("error", t("toast_incomplete_item"));
+    return;
+  }
+  stopTimer();
+  stopQuestionTimer(true);
+  if (state.quiz && !state.quiz.finished) updateSavedProgress();
+  if (state.abortCtrl) { try { state.abortCtrl.abort(); } catch {} }
+  state.staticQuestions = null;
+  state.importMeta = null;
+  state.focusRestore = null;
+  state.rendered = null;
+  state.regen = null;
+  /* وسّع الفقرات بالوضع المحفوظ مع الاختبار (الاختبار المعمق يحتاج ذلك لترقيم متطابق) */
+  applyAnalysis(it.analysis, (it.progress && it.progress.kwMode) || it.kwMode);
+  el("input-text").value = it.text || "";
+  updateCharCount();
+  const prog = validateProgress(it);
+  state.savedRef = { listId, itemId };
+  store.set(RESUME_KEY, JSON.stringify({
+    text: it.text || "",
+    analysis: it.analysis,
+    kwMode: it.kwMode || ((it.progress && it.progress.kwMode) || undefined),
+    savedAt: it.updatedAt || Date.now(),
+    progress: prog ? it.progress : null,
+    savedRef: { listId, itemId },
+  }));
+  if (prog) {
+    state.usedKeywords = prog.usedKeywords.map((a) => (Array.isArray(a) ? a.slice() : []));
+    state.round = prog.round || 1;
+    state.roundPcts = Array.isArray(prog.roundPcts) ? prog.roundPcts.slice() : [];
+    await resumeQuizRound(prog);
+    toast("success", t("toast_resumed_lib", { name: it.name, cur: prog.resumeAt + 1, total: state.activeParagraphs.length, score: state.quiz.score }));
+  } else {
+    if (!el("api-key").value.trim()) {
+      showScreen("setup");
+      toast("error", t("toast_need_key_lib"));
+      el("api-key").focus();
+      return;
+    }
+    state.usedKeywords = it.analysis.paragraphs.map(() => []);
+    state.round = 0;
+    state.roundPcts = [];
+    state.abortCtrl = new AbortController();
+    await beginRound();
+    toast("info", t("toast_started_lib_new", { name: it.name }));
+  }
+}
+
+function playLegacyItem(listId, it) {
+  const qs = normalizeImportedQuestions({
+    questions: (it.questions || []).map((q) => ({
+      keyword: q.keyword,
+      question: q.question,
+      options: q.options,
+      correctIndex: q.correctIndex,
+      explanation: q.explanation,
+    })),
+  });
+  if (!qs) {
+    toast("error", t("toast_corrupt_lib"));
+    deleteListItem(listId, it.id, true);
+    return;
+  }
+  startImported(qs, it.name || t("saved_quiz_fallback"), it.ctx, false, it.id);
+  state.savedRef = { listId, itemId: it.id };
+  toast("info", t("toast_started_lib_legacy", { name: it.name || t("saved_quiz_fallback") }));
+}
+
+function exportListItem(listId, itemId) {
+  const list = findList(loadLists(), listId);
+  const it = list ? list.items.find((x) => x.id === itemId) : null;
+  if (!it) return;
+  let questions = null;
+  if (it.source === "legacy" && Array.isArray(it.questions)) questions = it.questions;
+  else if (it.progress && Array.isArray(it.progress.questions)) questions = it.progress.questions.map((x) => x.q);
+  if (!questions || !questions.length) {
+    toast("error", t("toast_no_qs_export"));
+    return;
+  }
+  const data = {
+    app: "اختبرني",
+    exportedAt: new Date().toISOString(),
+    context: it.ctx || (it.analysis ? it.analysis.context : ""),
+    questions: questions.map((q, i) => ({
+      n: i + 1,
+      keyword: q.keyword || "",
+      question: q.question,
+      options: q.options,
+      correctAnswer: q.options[q.correctIndex],
+      explanation: q.explanation || "",
+    })),
+  };
+  const safeName = String(it.name || "quiz").replace(/[\\/:*?"<>|]/g, "").trim().slice(0, 30) || "quiz";
+  downloadFile("ihtibarani-" + safeName + ".json", JSON.stringify(data, null, 2), "application/json;charset=utf-8");
+  toast("success", t("toast_exported_from_list"));
+}
+
+function deleteListItem(listId, itemId, silent) {
+  const ls = loadLists();
+  const list = findList(ls, listId);
+  const it = list ? list.items.find((x) => x.id === itemId) : null;
+  if (!it) return;
+  if (!silent && !confirm(t("confirm_delete_item", { name: it.name }))) return;
+  list.items = list.items.filter((x) => x.id !== itemId);
+  if (state.savedRef && state.savedRef.itemId === itemId) {
+    state.savedRef = null;
+    patchResumeSavedRef(null);
+  }
+  saveLists(ls);
+  renderListsScreen();
+  renderListsOverview();
+  if (!silent) toast("info", t("toast_deleted_item"));
+}
+
+function moveItemTo(fromListId, itemId, toListId) {
+  if (fromListId === toListId) return;
+  const ls = loadLists();
+  const from = findList(ls, fromListId);
+  const to = findList(ls, toListId);
+  if (!from || !to) return;
+  const idx = from.items.findIndex((x) => x.id === itemId);
+  if (idx < 0) return;
+  if (to.items.length >= MAX_ITEMS) {
+    toast("error", t("toast_list_full", { name: getDefaultListDisplayName(to), max: MAX_ITEMS }));
+    return;
+  }
+  const [it] = from.items.splice(idx, 1);
+  to.items.unshift(it);
+  if (state.savedRef && state.savedRef.itemId === itemId) {
+    state.savedRef.listId = toListId;
+    patchResumeSavedRef(state.savedRef);
+  }
+  saveLists(ls);
+  renderListsScreen();
+  renderListsOverview();
+  toast("success", t("toast_moved_item", { item: it.name, list: getDefaultListDisplayName(to) }));
+}
+
+function reorderListItem(listId, itemId, dir) {
+  const ls = loadLists();
+  const list = findList(ls, listId);
+  if (!list) return;
+  const i = list.items.findIndex((x) => x.id === itemId);
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= list.items.length) return;
+  const [x] = list.items.splice(i, 1);
+  list.items.splice(j, 0, x);
+  saveLists(ls);
+  renderListsScreen();
+}
+
+/* ====== تصدير واستعادة النسخة الاحتياطية الكاملة ====== */
+function exportFullBackup() {
+  const backup = {
+    app: "اختبرني — نسخة احتياطية شاملة",
+    version: "2.0",
+    exportedAt: new Date().toISOString(),
+    lists: loadLists(),
+    history: loadHistory(),
+    achievements: loadAchievements(),
+    lastSession: loadLastSession(),
+  };
+  downloadFile("ihtibarani-backup-" + new Date().toISOString().slice(0, 10) + ".json", JSON.stringify(backup, null, 2), "application/json;charset=utf-8");
+  toast("success", t("toast_backup_exported"));
+}
+
+async function importFullBackup(file) {
+  if (!file) return;
+  let data;
+  try {
+    data = JSON.parse(await file.text());
+  } catch {
+    toast("error", t("toast_backup_invalid"));
+    return;
+  }
+  if (!data || typeof data !== "object" || (!data.lists && !data.history)) {
+    toast("error", t("toast_backup_wrong_app"));
+    return;
+  }
+  if (data.lists && Array.isArray(data.lists.lists)) {
+    saveLists(data.lists);
+  }
+  if (Array.isArray(data.history)) {
+    store.set("quiz_history", JSON.stringify(data.history.slice(0, 20)));
+  }
+  if (data.achievements && typeof data.achievements === "object") {
+    saveAchievements({ ...loadAchievements(), ...data.achievements });
+  }
+  if (data.lastSession && data.lastSession.analysis) {
+    store.set(RESUME_KEY, JSON.stringify(data.lastSession));
+  }
+  renderListsScreen();
+  renderListsOverview();
+  renderHistory();
+  renderResume();
+  toast("success", t("toast_backup_restored"));
+}
+
+/* ====== شاشة القوائم ====== */
+const listsUi = { tabId: null };
+
+function currentListId(ls) {
+  const want = listsUi.tabId || ls.activeListId || "default";
+  return findList(ls, want) ? want : ls.lists[0].id;
+}
+
+function renderListsScreen() {
+  const ls = loadLists();
+  const tabId = currentListId(ls);
+  ls.activeListId = tabId;
+  saveLists(ls);
+  const list = findList(ls, tabId);
+  if (!list) return;
+
+  const tabs = el("lists-tabs");
+  tabs.innerHTML = "";
+  ls.lists.forEach((l) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "list-tab" + (l.id === tabId ? " active" : "");
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", l.id === tabId ? "true" : "false");
+    const nm = document.createElement("span");
+    nm.className = "list-tab-name";
+    nm.textContent = getDefaultListDisplayName(l);
+    const ct = document.createElement("span");
+    ct.className = "list-tab-count";
+    ct.textContent = String(l.items.length);
+    b.appendChild(nm);
+    b.appendChild(ct);
+    b.addEventListener("click", () => { listsUi.tabId = l.id; renderListsScreen(); });
+    tabs.appendChild(b);
+  });
+
+  el("btn-list-rename").classList.toggle("hidden", !!list.builtin);
+  el("btn-list-delete").classList.toggle("hidden", !!list.builtin);
+  el("lists-active-hint").textContent = list.builtin
+    ? t("list_hint_default", { count: testCountWord(list.items.length) })
+    : t("list_hint_custom", { count: testCountWord(list.items.length), date: fmtShortDate(list.createdAt) });
+
+  const searchVal = String((el("lists-search") && el("lists-search").value) || "").trim().toLowerCase();
+  const filteredItems = list.items.filter((it) => {
+    if (!searchVal) return true;
+    const hay = [it.name || "", it.text || "", it.ctx || "", it.analysis ? it.analysis.context : ""].join(" ").toLowerCase();
+    return hay.includes(searchVal);
+  });
+
+  const ul = el("lists-items");
+  const empty = el("lists-empty");
+  ul.innerHTML = "";
+  if (!filteredItems.length) {
+    empty.classList.remove("hidden");
+    ul.classList.add("hidden");
+    return;
+  }
+  empty.classList.add("hidden");
+  ul.classList.remove("hidden");
+  filteredItems.forEach((it, idx) => ul.appendChild(buildListItemRow(list, it, idx)));
+}
+
+function addChip(parent, text, extra) {
+  const c = document.createElement("span");
+  c.className = "chip" + (extra ? " " + extra : "");
+  c.textContent = text;
+  parent.appendChild(c);
+  return c;
+}
+
+function buildListItemRow(list, it, idx) {
+  const li = document.createElement("li");
+  li.className = "lib-item";
+  li.style.animationDelay = Math.min(idx * 45, 400) + "ms";
+
+  const info = document.createElement("div");
+  info.className = "lib-info";
+
+  const name = document.createElement("span");
+  name.className = "lib-name";
+  name.textContent = it.name || t("saved_quiz_fallback");
+  name.title = t("item_open_title");
+  name.addEventListener("click", () => openLibraryItem(list.id, it.id));
+
+  const meta = document.createElement("div");
+  meta.className = "lib-meta";
+  /* عدد الأسئلة الحقيقي: في «الاختبار المعمق» سؤال لكل فكرة أساسية (وليس فقرة لكل سؤال) */
+  const savedMode = (it.progress && it.progress.kwMode) || it.kwMode || "none";
+  const count = it.source === "legacy"
+    ? (it.questions || []).length
+    : (it.analysis && Array.isArray(it.analysis.paragraphs)
+      ? (savedMode === "deep" ? countDeepQuestions(it.analysis.paragraphs) : it.analysis.paragraphs.length)
+      : 0);
+  addChip(meta, quizCountWord(count), "");
+  const prog = it.source === "session" ? validateProgress(it) : null;
+  if (prog) {
+    addChip(meta, t("item_resume_chip", { cur: prog.resumeAt + 1, total: prog.activeCount, scorePart: prog.score ? t("resume_score_part", { score: prog.score }) : "" }), "ok");
+  }
+  if (it.bestPct) addChip(meta, t("item_best_chip", { pct: it.bestPct }), "ok");
+  if (it.lastPct != null) addChip(meta, t("item_last_chip", { pct: it.lastPct }), "");
+  addChip(meta, it.plays ? playCountWord(it.plays) : t("item_unplayed"), "");
+  if (it.source === "legacy") addChip(meta, t("item_legacy_chip"), "");
+  addChip(meta, fmtShortDate(it.createdAt), "lib-date");
+
+  info.appendChild(name);
+  info.appendChild(meta);
+
+  const actions = document.createElement("div");
+  actions.className = "lib-actions";
+
+  const open = document.createElement("button");
+  open.className = "btn primary sm";
+  open.type = "button";
+  open.textContent = prog ? t("btn_item_resume") : t("btn_item_start");
+  open.setAttribute("aria-label", (prog ? t("btn_item_resume") : t("btn_item_start")) + " " + (it.name || t("saved_quiz_fallback")));
+  open.addEventListener("click", () => openLibraryItem(list.id, it.id));
+  actions.appendChild(open);
+
+  const hasQuestions = (it.source === "legacy" && (it.questions || []).length)
+    || (it.progress && Array.isArray(it.progress.questions) && it.progress.questions.length);
+  if (hasQuestions) {
+    const exp = document.createElement("button");
+    exp.className = "btn ghost sm";
+    exp.type = "button";
+    exp.textContent = t("btn_item_export");
+    exp.setAttribute("aria-label", t("btn_item_export") + " " + (it.name || "") + " JSON");
+    exp.addEventListener("click", () => exportListItem(list.id, it.id));
+    actions.appendChild(exp);
+  }
+
+  const others = loadLists().lists.filter((l) => l.id !== list.id);
+  if (others.length) {
+    const mv = document.createElement("select");
+    mv.className = "move-select";
+    mv.setAttribute("aria-label", t("aria_move_item"));
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = t("select_move_to");
+    ph.disabled = true;
+    ph.selected = true;
+    mv.appendChild(ph);
+    others.forEach((l) => {
+      const o = document.createElement("option");
+      o.value = l.id;
+      o.textContent = getDefaultListDisplayName(l) + " (" + l.items.length + ")";
+      mv.appendChild(o);
+    });
+    mv.addEventListener("change", () => {
+      if (mv.value) moveItemTo(list.id, it.id, mv.value);
+      mv.value = "";
+    });
+    actions.appendChild(mv);
+  }
+
+  const ren = document.createElement("button");
+  ren.className = "icon-btn lib-ren";
+  ren.type = "button";
+  ren.title = t("btn_rename");
+  ren.setAttribute("aria-label", t("btn_rename") + " " + (it.name || ""));
+  ren.innerHTML = PENCIL_ICON;
+  ren.addEventListener("click", () => startItemInlineRename(li, list.id, it.id));
+  actions.appendChild(ren);
+
+  const up = document.createElement("button");
+  up.className = "icon-btn lib-move";
+  up.type = "button";
+  up.title = t("btn_move_up");
+  up.setAttribute("aria-label", t("btn_move_up") + " " + (it.name || ""));
+  up.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="18 15 12 9 6 15"/></svg>';
+  up.disabled = idx === 0;
+  up.addEventListener("click", () => reorderListItem(list.id, it.id, -1));
+  actions.appendChild(up);
+
+  const down = document.createElement("button");
+  down.className = "icon-btn lib-move";
+  down.type = "button";
+  down.title = t("btn_move_down");
+  down.setAttribute("aria-label", t("btn_move_down") + " " + (it.name || ""));
+  down.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>';
+  down.disabled = idx === list.items.length - 1;
+  down.addEventListener("click", () => reorderListItem(list.id, it.id, 1));
+  actions.appendChild(down);
+
+  const del = document.createElement("button");
+  del.className = "icon-btn lib-del";
+  del.type = "button";
+  del.setAttribute("aria-label", t("btn_delete") + " " + (it.name || ""));
+  del.title = t("btn_delete");
+  del.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
+  del.addEventListener("click", () => deleteListItem(list.id, it.id));
+  actions.appendChild(del);
+
+  li.appendChild(info);
+  li.appendChild(actions);
+  return li;
+}
+
+function renderListsOverview() {
+  const wrap = el("lists-overview");
+  if (!wrap) return;
+  const ls = loadLists();
+  wrap.innerHTML = "";
+  ls.lists.forEach((l) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "list-pill";
+    b.setAttribute("aria-label", t("aria_open_list", { name: getDefaultListDisplayName(l), count: testCountWord(l.items.length) }));
+    const nm = document.createElement("span");
+    nm.textContent = getDefaultListDisplayName(l);
+    const ct = document.createElement("span");
+    ct.className = "list-pill-count" + (l.items.length ? "" : " zero");
+    ct.textContent = String(l.items.length);
+    b.appendChild(nm);
+    b.appendChild(ct);
+    b.addEventListener("click", () => {
+      listsUi.tabId = l.id;
+      renderListsScreen();
+      showScreen("lists");
+    });
+    wrap.appendChild(b);
+  });
+}
+
+function startItemInlineRename(li, listId, itemId) {
+  const nameSpan = li.querySelector(".lib-name");
+  if (!nameSpan || li.querySelector(".lib-rename-input")) return;
+  const l0 = findList(loadLists(), listId);
+  const it0 = l0 ? l0.items.find((x) => x.id === itemId) : null;
+  if (!it0) return;
+  const oldName = it0.name || "";
+  let done = false;
+
+  const finish = (saveChanges) => {
+    if (done) return;
+    done = true;
+    if (saveChanges) {
+      const next = (input.value || "").trim().slice(0, 80) || oldName;
+      if (next !== oldName) {
+        withItem(listId, itemId, (it) => { it.name = next; it.updatedAt = Date.now(); });
+        toast("success", t("toast_renamed_item", { name: next }));
+      }
+    }
+    renderListsScreen();
+  };
+
+  nameSpan.innerHTML = "";
+  const input = document.createElement("input");
+  input.className = "lib-rename-input";
+  input.type = "text";
+  input.value = oldName;
+  input.maxLength = 80;
+  input.setAttribute("aria-label", t("aria_rename_input"));
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+  nameSpan.appendChild(input);
+  input.focus();
+  input.select();
+}
+
+/* ====== نافذة اسم القائمة ====== */
+let listNameCtx = { mode: "create", listId: null };
+let listNameReturnFocus = null;
+
+function isListNameOpen() {
+  return !el("list-name-overlay").classList.contains("hidden");
+}
+
+function openListNameModal(mode, listId) {
+  if (isListNameOpen()) return;
+  listNameCtx = { mode, listId: listId || null };
+  const isRename = mode === "rename";
+  el("list-name-title-text").textContent = isRename ? t("list_name_title_rename") : t("list_name_title_new");
+  el("btn-list-name-confirm").textContent = isRename ? t("btn_save_name") : t("btn_create");
+  let prefill = "";
+  if (isRename) {
+    const l = findList(loadLists(), listId);
+    prefill = l ? l.name : "";
+  }
+  el("list-name-input").value = prefill;
+  listNameReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  el("list-name-overlay").classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+  try { el("list-name-input").focus(); el("list-name-input").select(); } catch {}
+}
+
+function closeListNameModal() {
+  const ov = el("list-name-overlay");
+  if (ov.classList.contains("hidden")) return;
+  ov.classList.add("hidden");
+  document.body.style.overflow = "";
+  if (listNameReturnFocus && document.contains(listNameReturnFocus)) {
+    try { listNameReturnFocus.focus(); } catch {}
+  }
+  listNameReturnFocus = null;
+}
+
+function confirmListName() {
+  const name = el("list-name-input").value.trim().slice(0, 40);
+  if (!name) { toast("error", t("toast_enter_list_name")); try { el("list-name-input").focus(); } catch {} return; }
+  const ls = loadLists();
+  if (listNameCtx.mode === "create") {
+    if (ls.lists.length >= MAX_LISTS) { toast("error", t("toast_max_lists", { max: MAX_LISTS })); return; }
+    if (ls.lists.some((l) => l.name === name)) { toast("error", t("toast_list_exists")); return; }
+    const l = { id: uid("l"), name, createdAt: Date.now(), items: [] };
+    ls.lists.push(l);
+    listsUi.tabId = l.id;
+    saveLists(ls);
+    closeListNameModal();
+    renderListsScreen();
+    renderListsOverview();
+    toast("success", t("toast_list_created", { name }));
+  } else {
+    const l = findList(ls, listNameCtx.listId);
+    if (!l || l.builtin) { closeListNameModal(); return; }
+    if (l.name !== name && ls.lists.some((x) => x.id !== l.id && x.name === name)) {
+      toast("error", t("toast_other_list_exists"));
+      return;
+    }
+    l.name = name;
+    saveLists(ls);
+    closeListNameModal();
+    renderListsScreen();
+    renderListsOverview();
+    toast("success", t("toast_list_renamed", { name }));
+  }
+}
+
+function deleteActiveList() {
+  const ls = loadLists();
+  const list = findList(ls, currentListId(ls));
+  if (!list || list.builtin) return;
+  if (!confirm(t("confirm_delete_list", { name: list.name, count: list.items.length }))) return;
+  ls.lists = ls.lists.filter((l) => l.id !== list.id);
+  if (!findList(ls, ls.activeListId)) ls.activeListId = "default";
+  listsUi.tabId = "default";
+  if (state.savedRef && state.savedRef.listId === list.id) {
+    state.savedRef = null;
+    patchResumeSavedRef(null);
+  }
+  saveLists(ls);
+  renderListsScreen();
+  renderListsOverview();
+  toast("info", t("toast_list_deleted", { name: list.name }));
+}
+
+function isOverlayVisibleById(id) {
+  const n = el(id);
+  return !!n && !n.classList.contains("hidden");
+}
+
+function trapOverlayTab(id, e) {
+  const focusables = [...el(id).querySelectorAll("button, input, select, [tabindex='0']")]
+    .filter((n) => !n.disabled && n.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+/* ====== طباعة الاختبار (PDF عبر نافذة الطباعة) ====== */
+function buildPrintSheet() {
+  if (!lastResults) return;
+  const letters = isEn() ? ["A", "B", "C", "D"] : ["أ", "ب", "ج", "د"];
+  let dateStr = "";
+  try { dateStr = new Date().toLocaleString(getUiLocale(), { day: "numeric", month: "long", year: "numeric" }); } catch {}
+  const ctx = state.analysis && state.analysis.context ? state.analysis.context : "";
+  let html = `<header class="ps-head"><h1>${escHtml(t("print_title"))}</h1><p class="ps-meta">${escHtml(t("txt_export_date"))}${escHtml(dateStr)}${ctx ? ` — ${escHtml(t("sg_copy_context"))}${escHtml(ctx)}` : ""}</p></header>`;
+  html += '<ol class="ps-questions">';
+  lastResults.answers.forEach((q, i) => {
+    html += `<li><p class="ps-q"><span class="ps-num">${i + 1}</span> <span class="ps-md-slot" data-ps-md="q:${i}"></span></p><ul class="ps-opts">`;
+    q.options.forEach((o, oi) => {
+      html += `<li><span class="ps-letter">${letters[oi] || (oi + 1)}</span> <span class="ps-md-slot" data-ps-md="o:${i}:${oi}"></span></li>`;
+    });
+    html += "</ul></li>";
+  });
+  html += "</ol>";
+  html += `<section class="ps-key"><h2>${escHtml(t("print_key_title"))}</h2><ol>`;
+  lastResults.answers.forEach((q, i) => {
+    html += `<li><strong>${i + 1}) <span class="ps-md-slot" data-ps-md="c:${i}"></span></strong>${q.explanation ? `<p class="ps-explain"><span class="ps-md-slot" data-ps-md="e:${i}"></span></p>` : ""}${q.userNote && q.userNote.trim() ? `<p class="ps-explain">${escHtml(t("print_note_prefix"))}${escHtml(q.userNote.trim())}</p>` : ""}</li>`;
+  });
+  html += "</ol></section>";
+  html += `<footer class="ps-foot">${escHtml(t("print_footer"))}</footer>`;
+  const sheet = el("print-sheet");
+  sheet.innerHTML = html;
+  /* خانات السؤال/الخيارات/الإجابة الصحيحة/التعليل تُملأ بمسار Markdown الكامل —
+     كل خانة بمعالجة مستقلة (متجر رياضيات خاص بها) ثم KaTeX لما تبقى نصًا عاديًا */
+  sheet.querySelectorAll(".ps-md-slot[data-ps-md]").forEach((slot) => {
+    const parts = slot.getAttribute("data-ps-md").split(":");
+    const q = lastResults.answers[Number(parts[1])];
+    if (!q) return;
+    const kind = parts[0];
+    let text = "";
+    if (kind === "q") text = q.question;
+    else if (kind === "o") text = q.options[Number(parts[2])] || "";
+    else if (kind === "c") text = q.options[q.correctIndex] || "";
+    else if (kind === "e") text = q.explanation || "";
+    slot.appendChild(richFieldFrag(text));
+  });
+  renderMathInTextNodes(sheet);
+}
+
+function printQuiz() {
+  if (!lastResults) return;
+  buildPrintSheet();
+  toast("info", t("toast_print_opened"));
+  window.print();
+}
+
+/* ====== استيراد اختبار من ملف JSON ====== */
+function normalizeImportedQuestions(data) {
+  if (!data || typeof data !== "object" || !Array.isArray(data.questions) || !data.questions.length) return null;
+  const out = [];
+  for (const raw of data.questions) {
+    const options = Array.isArray(raw.options) ? raw.options.map((o) => String(o).trim()).filter(Boolean) : [];
+    const question = String(raw.question || "").trim();
+    if (!question || options.length < 2) return null;
+    let ci = -1;
+    if (typeof raw.correctIndex === "number" && Number.isInteger(raw.correctIndex)) ci = raw.correctIndex;
+    else if (raw.correctAnswer != null) ci = options.indexOf(String(raw.correctAnswer).trim());
+    if (ci < 0 || ci >= options.length) return null;
+    out.push({
+      paragraphIndex: out.length,
+      qType: raw.qType || (options.length === 2 ? "tf" : "mcq"),
+      keyword: String(raw.keyword || "").trim(),
+      question,
+      options,
+      correctIndex: ci,
+      explanation: String(raw.explanation || "").trim(),
+      userAnswer: null,
+      correct: null,
+      starred: !!raw.starred,
+      userNote: String(raw.userNote || ""),
+    });
+  }
+  return out.length ? out : null;
+}
+
+async function handleImportFile(file) {
+  if (!file) return;
+  let data;
+  try {
+    data = JSON.parse(await file.text());
+  } catch {
+    toast("error", t("toast_invalid_json"));
+    return;
+  }
+  const questions = normalizeImportedQuestions(data);
+  if (!questions) {
+    toast("error", t("toast_invalid_schema"));
+    return;
+  }
+  startImported(questions, String(file.name || "").replace(/\.json$/i, "") || t("quiz_source_imported"), data.context, false);
+  toast("success", t("toast_imported_qs", { qs: quizCountWord(questions.length) }));
+}
+
+function startImported(questions, metaName, context, isLink, libId) {
+  stopTimer();
+  stopQuestionTimer(true);
+  if (state.abortCtrl) { try { state.abortCtrl.abort(); } catch {} }
+  state.staticQuestions = questions;
+  state.importMeta = { name: metaName, link: !!isLink, libId: libId || null };
+  state.savedRef = null;
+  state.analysis = { context: String(context || ""), paragraphs: [] };
+  state.activeParagraphs = questions;
+  state.usedKeywords = questions.map(() => []);
+  state.roundPcts = [];
+  state.round = 0;
+  state.focusRestore = null;
+  beginRound();
+}
+
+/* ====== مشاركة الاختبار عبر رابط (Base64 في الهاش) ====== */
+function encodeQuizPayload(obj) {
+  const bytes = new TextEncoder().encode(JSON.stringify(obj));
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function decodeQuizPayload(s) {
+  const bin = atob(s);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function buildShareUrl() {
+  if (!lastResults || !lastResults.answers.length) return null;
+  const payload = {
+    v: 1,
+    ctx: state.analysis ? state.analysis.context : "",
+    qs: lastResults.answers.map((q) => ({
+      k: q.keyword || "",
+      q: q.question,
+      o: q.options,
+      ci: q.correctIndex,
+      e: q.explanation || "",
+    })),
+  };
+  const url = location.origin + location.pathname + "#q=" + encodeURIComponent(encodeQuizPayload(payload));
+  return { url, size: url.length };
+}
+
+async function copyTextToClipboard(text, successMsg) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("success", successMsg);
+    return true;
+  } catch {}
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {}
+  document.body.removeChild(ta);
+  toast(ok ? "success" : "error", ok ? successMsg : t("toast_copy_failed"));
+  return ok;
+}
+
+async function shareQuizLink() {
+  const built = buildShareUrl();
+  if (!built) {
+    toast("error", t("toast_no_quiz_share"));
+    return;
+  }
+  if (built.size > 14000) {
+    toast("error", t("toast_quiz_too_long_link"));
+    return;
+  }
+  await copyTextToClipboard(built.url, t("toast_link_copied"));
+}
+
+function clearSharedHash() {
+  if (location.hash.indexOf("#q=") === 0) {
+    try { history.replaceState(null, "", location.pathname + location.search); } catch {}
+  }
+}
+
+function normalizeSharedQuestions(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  if (Array.isArray(payload.qs)) {
+    const out = [];
+    for (const raw of payload.qs) {
+      const options = Array.isArray(raw.o) ? raw.o.map((x) => String(x).trim()).filter(Boolean) : [];
+      const question = String(raw.q || "").trim();
+      if (!question || options.length < 2) return null;
+      const ci = Number.isInteger(raw.ci) ? raw.ci : -1;
+      if (ci < 0 || ci >= options.length) return null;
+      out.push({
+        paragraphIndex: out.length,
+        qType: options.length === 2 ? "tf" : "mcq",
+        keyword: String(raw.k || "").trim(),
+        question,
+        options,
+        correctIndex: ci,
+        explanation: String(raw.e || "").trim(),
+        userAnswer: null,
+        correct: null,
+        starred: false,
+        userNote: "",
+      });
+    }
+    return out.length ? out : null;
+  }
+  if (Array.isArray(payload.questions)) return normalizeImportedQuestions(payload);
+  return null;
+}
+
+function checkHashQuiz() {
+  const m = location.hash.match(/[#&]q=([^&]+)/);
+  if (!m) return false;
+  let payload = null;
+  try {
+    payload = decodeQuizPayload(decodeURIComponent(m[1]));
+  } catch {}
+  const questions = normalizeSharedQuestions(payload);
+  if (!questions) {
+    toast("error", t("toast_invalid_link"));
+    clearSharedHash();
+    return false;
+  }
+  startImported(questions, t("shared_link_name"), payload && payload.ctx, true);
+  toast("success", t("toast_shared_arrived", { qs: quizCountWord(questions.length) }));
+  return true;
+}
+
+/* ====== بطاقات المراجعة (Flashcards) ====== */
+const cardsState = { cards: [], order: [], pos: 0, recallOn: false, known: [], review: [] };
+
+function buildFlashcards() {
+  const cards = [];
+  if (state.staticQuestions) {
+    state.staticQuestions.forEach((q) => {
+      cards.push({
+        keyword: q.keyword || t("card_fallback_kw"),
+        sentence: q.explanation || q.question,
+        qref: { paragraphIndex: q.paragraphIndex, keyword: q.keyword || "" },
+      });
+    });
+    return cards;
+  }
+  (state.analysis ? state.analysis.paragraphs : []).forEach((p, pIdx) => {
+    const sentences = String(p.text).split(/(?<=[.!؟?])\s+/).map((s) => s.trim()).filter(Boolean);
+    (p.keywords || []).forEach((kw) => {
+      const target = sentences.find((s) => s.includes(kw)) || p.text;
+      cards.push({ keyword: kw, sentence: target, qref: { paragraphIndex: pIdx, keyword: kw } });
+    });
+  });
+  return cards;
+}
+
+function openCards() {
+  const cards = buildFlashcards();
+  if (!cards.length) {
+    toast("error", t("toast_no_cards"));
+    return;
+  }
+  cardsState.cards = cards;
+  cardsState.order = shuffle(cards.map((_, i) => i));
+  cardsState.pos = 0;
+  cardsState.recallOn = false;
+  cardsState.known = [];
+  cardsState.review = [];
+  const rbtn = el("btn-recall-mode");
+  if (rbtn) { rbtn.classList.remove("active"); rbtn.setAttribute("aria-pressed", "false"); }
+  const rchip = el("recall-progress");
+  if (rchip) rchip.classList.add("hidden");
+  el("flashcard").classList.remove("recall");
+  showScreen("cards");
+  renderCard();
+}
+
+function highlightKeywordFrag(sentence, keyword) {
+  const frag = document.createDocumentFragment();
+  const text = String(sentence || "");
+  const kw = String(keyword || "").trim();
+  if (!kw) { frag.appendChild(document.createTextNode(text)); return frag; }
+  let re;
+  try {
+    re = new RegExp(kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+  } catch {
+    frag.appendChild(document.createTextNode(text));
+    return frag;
+  }
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    if (m[0].length === 0) { re.lastIndex++; continue; }
+    frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const mark = document.createElement("mark");
+    mark.className = "kw-hl";
+    mark.textContent = m[0];
+    frag.appendChild(mark);
+    last = m.index + m[0].length;
+  }
+  frag.appendChild(document.createTextNode(text.slice(last)));
+  return frag;
+}
+
+function looksLikePassageHeading(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return false;
+  if (/^#{1,6}\s+/.test(t)) return true;
+  if (/[:：]$/.test(t)) return t.length <= 120;
+  if (/[.!?…؟،؛]$/.test(t)) return false;
+  return t.length <= 80;
+}
+
+/* ====== وحدة Markdown لعرض الفقرة — CommonMark + GFM (جداول/مهام/حواشي/إيموجي/روابط) + KaTeX + Mermaid ======
+   النص الأصلي يبقى بصيغة Markdown في التخزين، والتحويل يحدث لحظة العرض فقط.
+   إن تعذر تحميل مكتبات العرض (vendor) يعود العرض تلقائيًا إلى المسار النصي القديم دون أي فقد. */
+function looksLikeMarkdownText(t) {
+  const s = String(t || "");
+  if (!s) return false;
+  if (/(^|\n)[ \t]*#{1,6}[ \t]+\S/.test(s)) return true;                /* عناوين */
+  if (/(^|\n)[ \t]*(>|[-*+]|\d{1,3}[.)])[ \t]+\S/.test(s)) return true; /* قوائم/اقتباسات */
+  if (/```|~~~/.test(s)) return true;                                    /* أسيطة كود/mermaid */
+  if ((s.match(/\|/g) || []).length >= 2) return true;                   /* جداول محتملة */
+  if (/\*\*[^*\n]+\*\*|(^|\W)__[^_\n]+__/.test(s)) return true;          /* عريض */
+  if (/(^|\W)~~[^~\n]+~~/.test(s)) return true;                          /* مشطوب */
+  if (/\[[^\]\n]{1,200}\]\([^)\n]{1,500}\)/.test(s)) return true;        /* روابط */
+  if (/<https?:\/\/\S+>|(www\.)\S{5,}/.test(s)) return true;             /* روابط تلقائية */
+  if (/(^|\n)[ \t]*[-*+][ \t]+\[[ xX]\]/.test(s)) return true;           /* قوائم مهام */
+  if (/\$\$[^$]+\$\$|\\\([\s\S]+?\\\)|\\\[[\s\S]+?\\\]/.test(s)) return true; /* رياضيات */
+  if (/(^|\n)[ \t]*\[\^[^\]\n]+\]/.test(s)) return true;                 /* حواشي سفلية */
+  if (/(^|\n)[ \t]*\[[^\]\n]+\]:[ \t]*\S/.test(s)) return true;          /* روابط مرجعية */
+  if (/(^|\n)[ \t]*:{1,2}[a-z0-9_+-]+:{1,2}/i.test(s)) return true;      /* إيموجي بصيغة :name: */
+  return false;
+}
+
+/* فاصل GFM قياسي بعد الترويسة — يدعم محاذاة :--- :---: ---: إن وُجدت في الأصل */
+function mdIsTableSeparator(line) {
+  return /^[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*(\|[ \t]*:?-{2,}:?[ \t]*)*\|?[ \t]*$/.test(line) && line.includes("|");
+}
+
+/* جداول متساهلة: إن كتب المستخدم صفوف أنابيب متساوية دون فاصل GFM (كالمثال «اللغة| الاستخدام| المستوى»)
+   نُدرج فاصلًا افتراضيًا بعد أول سطر حتى تُعرض كجدول حقيقي — خارج أسيطة الكود فقط.
+   ملاحظة: جدول GFM القياسي (ترويسة + فاصل) يُنسخ حرفيًا دون أي فاصل مزيف داخله. */
+function mdInjectLenientTables(lines) {
+  const isFence = (l) => /^[ \t]*(```|~~~)/.test(l);
+  const pipeCount = (l) => (l.match(/\|/g) || []).length;
+  const out = [];
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (isFence(line)) { inFence = !inFence; out.push(line); continue; }
+    if (inFence) { out.push(line); continue; }
+    /* جدول GFM قياسي (ترويسة يليها فاصل): انسخ الكتلة كاملة كما هي — إصلاح الفاصل الوهمي */
+    if (line.includes("|") && !mdIsTableSeparator(line) &&
+        i + 1 < lines.length && mdIsTableSeparator(lines[i + 1])) {
+      out.push(line);
+      out.push(lines[i + 1]);
+      i += 2;
+      while (i < lines.length && lines[i].includes("|") && !isFence(lines[i]) && !mdIsTableSeparator(lines[i])) {
+        out.push(lines[i]);
+        i++;
+      }
+      i--; /* يُعوّض في زيادة التكرار التالية */
+      continue;
+    }
+    out.push(line);
+    if (!line.includes("|") || mdIsTableSeparator(line)) continue;
+    if (/^[ \t]*(>|#{1,6}[ \t]|[-*+][ \t]+|\d{1,3}[.)][ \t]+)/.test(line)) continue;
+    const next = lines[i + 1];
+    if (next === undefined || !next.includes("|") || mdIsTableSeparator(next)) continue;
+    const cols = pipeCount(line);
+    if (cols < 1) continue;
+    let end = i + 1;
+    while (end < lines.length && lines[end].includes("|") && !isFence(lines[end]) &&
+      pipeCount(lines[end]) === cols && !mdIsTableSeparator(lines[end])) end++;
+    if (end - (i + 1) >= 1) {
+      out.push("|" + new Array(cols + 1).fill(" --- ").join("|") + "|");
+      /* انقل الصفوف المكتشفة كما هي (ستعالج في الدورة التالية من الحلقة الخارجية) */
+      for (let k = i + 1; k < end; k++) out.push(lines[k]);
+      i = end - 1;
+    }
+  }
+  return out;
+}
+
+function mdPreprocessSource(text) {
+  const src = String(text || "").replace(/\r\n?/g, "\n");
+  return mdInjectLenientTables(src.split("\n")).join("\n");
+}
+
+/* حجب مقاطع الرياضيات قبل محلل Markdown حتى لا تفسدها قواعده:
+   \( و\[ تُعامل كـ escape فيُحذف الشرط، و| داخل $|x|$ يفسد عد أعمدة الجداول.
+   نستبدلها مؤقتًا برموز بديلة محايدة ثم نعيد النص الأصلي بعد التصيير.
+   كتل الكود (``` أو ~~~) مستبعدة من الحجب. */
+const MATH_SCAN_G = /\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$[^$\n]+?\$/g;
+
+function mdExtractMath(src) {
+  const store = [];
+  const parts = String(src || "").split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$))/);
+  const masked = parts.map((part, idx) => {
+    if (idx % 2 === 1) return part; /* كتلة كود — دون تعديل */
+    return part.replace(MATH_SCAN_G, (m) => {
+      store.push(m);
+      return "@@KTMATH" + (store.length - 1) + "@@";
+    });
+  }).join("");
+  return { masked, store };
+}
+
+/* استعادة نصوص الرياضيات المحجوبة داخل عقد DOM النصية قبل تشغيل KaTeX auto-render */
+function mdRestoreMathText(root, store) {
+  if (!store || !store.length || !root) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(n) {
+      return n.nodeValue && n.nodeValue.indexOf("@@KTMATH") !== -1 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+  const targets = [];
+  let n;
+  while ((n = walker.nextNode())) targets.push(n);
+  targets.forEach((node) => {
+    const frag = document.createDocumentFragment();
+    node.nodeValue.split(/(@@KTMATH\d+@@)/).forEach((part) => {
+      const m = part.match(/^@@KTMATH(\d+)@@$/);
+      if (m) frag.appendChild(document.createTextNode(store[Number(m[1])] || ""));
+      else if (part) frag.appendChild(document.createTextNode(part));
+    });
+    node.parentNode.replaceChild(frag, node);
+  });
+}
+
+let _mdParser = null;
+function ensureMarkdownParser() {
+  if (_mdParser !== null) return _mdParser;
+  const MarkdownIt = window.markdownit;
+  if (typeof MarkdownIt !== "function") { _mdParser = false; return false; }
+  try {
+    const p = new MarkdownIt({
+      html: false,      /* أمان: HTML خام ممنوع — يُهرَّب كنص */
+      linkify: true,    /* روابط تلقائية */
+      breaks: true,     /* سطر واحد = فاصل سطر (يحافظ على بنية الفقرات القديمة) */
+      typographer: false,
+    });
+    if (typeof window.markdownitFootnote === "function") p.use(window.markdownitFootnote);
+    if (typeof window.markdownitTaskLists === "function") p.use(window.markdownitTaskLists, { enabled: false, label: true });
+    if (typeof window.markdownitEmoji === "function") p.use(window.markdownitEmoji);
+    const defLink = p.renderer.rules.link_open;
+    p.renderer.rules.link_open = (tokens, idx, opts, env, self) => {
+      tokens[idx].attrSet("target", "_blank");
+      tokens[idx].attrSet("rel", "noopener noreferrer");
+      return defLink ? defLink(tokens, idx, opts, env, self) : self.renderToken(tokens, idx, opts);
+    };
+    _mdParser = p;
+    return p;
+  } catch (e) {
+    console.warn("[Markdown] parser init failed", e);
+    _mdParser = false;
+    return false;
+  }
+}
+
+/* اتجاه كل كتلة حسب أول حرف قوي (دعم العربية/الإنجليزية/المختلطة) */
+function applyMarkdownDirection(root) {
+  root.querySelectorAll("p, h1, h2, h3, h4, h5, h6, li, blockquote, td, th, figcaption, dt, dd, .footnotes").forEach((b) => {
+    b.setAttribute("dir", "auto");
+  });
+  root.querySelectorAll("pre").forEach((c) => c.setAttribute("dir", "ltr"));
+}
+
+/* جداول: غلاف بتمرير أفقي دون تجاوز الحاوية + قابلية تمرير بلوحة المفاتيح */
+function wrapMarkdownTables(root) {
+  root.querySelectorAll("table").forEach((tb) => {
+    if (tb.parentElement && tb.parentElement.classList.contains("md-table-wrap")) return;
+    const w = document.createElement("div");
+    w.className = "md-table-wrap";
+    w.setAttribute("role", "region");
+    w.setAttribute("aria-label", t("md_table_aria"));
+    w.setAttribute("tabindex", "0");
+    tb.setAttribute("dir", "auto");
+    tb.parentNode.insertBefore(w, tb);
+    w.appendChild(tb);
+  });
+}
+
+/* صور: تحميل مؤجل + بديل نصي أنيق عند تعذر التحميل */
+function enhanceMarkdownMedia(root) {
+  root.querySelectorAll("img").forEach((img) => {
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.addEventListener("error", () => {
+      const span = document.createElement("span");
+      span.className = "md-img-fallback";
+      span.textContent = "🖼️ " + (img.getAttribute("alt") || t("md_img_unavailable"));
+      img.replaceWith(span);
+    }, { once: true });
+  });
+}
+
+/* تمييز الكلمة المفتاحية داخل DOM المُصيَّر (يحافظ على وظيفة التمييز القديمة) */
+function highlightKeywordInMarkdown(root, keyword) {
+  const kw = String(keyword || "").trim();
+  if (!kw) return;
+  const esc = kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let testRe;
+  try { testRe = new RegExp(esc); } catch { return; }
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const v = node.nodeValue;
+      if (!v || !v.trim()) return NodeFilter.FILTER_REJECT;
+      const p = node.parentElement;
+      if (!p) return NodeFilter.FILTER_REJECT;
+      if (p.closest("code, pre, .katex, .md-mermaid, mark, script, style, a.md-no-hl")) return NodeFilter.FILTER_REJECT;
+      return testRe.test(v) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+  const targets = [];
+  while (walker.nextNode()) targets.push(walker.currentNode);
+  targets.forEach((node) => {
+    const text = node.nodeValue;
+    const re = new RegExp(esc, "g");
+    const frag = document.createDocumentFragment();
+    let last = 0, m, hits = 0;
+    while ((m = re.exec(text)) && hits < 50) {
+      if (!m[0].length) { re.lastIndex++; continue; }
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const mark = document.createElement("mark");
+      mark.className = "kw-hl";
+      mark.textContent = m[0];
+      frag.appendChild(mark);
+      last = m.index + m[0].length;
+      hits++;
+    }
+    if (!hits) return;
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    node.parentNode.replaceChild(frag, node);
+  });
+}
+
+/* استخراج أسيطة ```mermaid إلى حاويات تُرسم لاحقًا (تحميل Mermaid عند الحاجة فقط) */
+function collectMermaidBlocks(root) {
+  root.querySelectorAll("pre > code").forEach((code) => {
+    const isMermaid = [...code.classList].some((c) => /^(language|lang)-mermaid$/i.test(c));
+    if (!isMermaid) return;
+    const pre = code.parentElement;
+    const block = document.createElement("div");
+    block.className = "md-mermaid";
+    block.setAttribute("data-code", code.textContent);
+    block.textContent = t("mermaid_loading");
+    pre.replaceWith(block);
+  });
+}
+
+let _mermaidLoading = null;
+function ensureMermaidLib() {
+  if (window.mermaid) return Promise.resolve(window.mermaid);
+  if (_mermaidLoading) return _mermaidLoading;
+  _mermaidLoading = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "vendor/mermaid/mermaid.min.js";
+    s.async = true;
+    s.onload = () => {
+      try {
+        const dark = document.documentElement.getAttribute("data-theme") === "dark";
+        window.mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "strict",
+          theme: dark ? "dark" : "default",
+          fontFamily: "Cairo, sans-serif",
+        });
+        resolve(window.mermaid);
+      } catch (e) { reject(e); }
+    };
+    s.onerror = () => { _mermaidLoading = null; reject(new Error(t("mermaid_err"))); };
+    document.head.appendChild(s);
+  });
+  return _mermaidLoading;
+}
+
+function mermaidFallback(block) {
+  block.classList.add("fail");
+  block.innerHTML = "";
+  const pre = document.createElement("pre");
+  pre.className = "md-code";
+  pre.setAttribute("dir", "ltr");
+  pre.textContent = block.getAttribute("data-code") || "";
+  block.appendChild(pre);
+}
+
+async function renderMermaidBlocks(root) {
+  const blocks = [...root.querySelectorAll(".md-mermaid[data-code]")].filter((b) => !b.dataset.rendered);
+  if (!blocks.length) return;
+  let mm;
+  try {
+    mm = await ensureMermaidLib();
+  } catch (e) {
+    console.warn("[Mermaid]", e);
+    blocks.forEach(mermaidFallback);
+    return;
+  }
+  for (const block of blocks) {
+    block.dataset.rendered = "1";
+    const code = block.getAttribute("data-code") || "";
+    try {
+      const { svg } = await mm.render("mmd-" + Date.now() + "-" + Math.floor(Math.random() * 1e6), code);
+      block.innerHTML = svg;
+      block.classList.add("ok");
+    } catch (err) {
+      console.warn("[Mermaid] render", err);
+      mermaidFallback(block);
+    }
+  }
+}
+
+/* المعادلات الرياضية — KaTeX auto-render على DOM المُعقّم */
+function renderMarkdownMath(root) {
+  if (typeof window.renderMathInElement !== "function") return;
+  try {
+    window.renderMathInElement(root, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true },
+        { left: "\\[", right: "\\]", display: true },
+        { left: "\\(", right: "\\)", display: false },
+        { left: "$", right: "$", display: false },
+      ],
+      ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code", "option"],
+      ignoredClasses: ["md-mermaid", "md-code"],
+      throwOnError: false,
+    });
+  } catch (e) { console.warn("[KaTeX]", e); }
+}
+
+/* =========================================================
+   وحدة المعادلات الرياضية العامة (LaTeX/KaTeX) — في كل واجهات الاختبار:
+   نص السؤال، الخيارات، التعليل، التلميح، قائمة المراجعة، بطاقات الكلمات،
+   دليل الدراسة، وورقة الطباعة. النص الأصلي يبقى محفوظًا كما هو في التخزين،
+   والتصيير يحدث لحظة العرض فقط. إن لم تتوفر KaTeX يبقى النص حرفيًا كما هو.
+   ========================================================= */
+const MATH_SCAN_RE = /\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$[^$\n]+?\$/;
+
+function hasMathSyntax(text) {
+  return MATH_SCAN_RE.test(String(text || ""));
+}
+
+function katexReady() {
+  return typeof window.katex === "object" && window.katex !== null && typeof window.katex.render === "function";
+}
+
+/* يقطع النص إلى مقاطع متتالية (رياضيات / نص عادي) — الأولوية: $$ ثم \[ \] ثم \( \) ثم $ */
+function splitMathSegments(text) {
+  const src = String(text || "");
+  const segs = [];
+  const re = /\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$[^$\n]+?\$/g;
+  let last = 0, m;
+  while ((m = re.exec(src))) {
+    if (m.index > last) segs.push({ math: false, text: src.slice(last, m.index) });
+    const raw = m[0];
+    let tex = raw;
+    let display = false;
+    if (raw.startsWith("$$")) { tex = raw.slice(2, -2); display = true; }
+    else if (raw.startsWith("\\[")) { tex = raw.slice(2, -2); display = true; }
+    else if (raw.startsWith("\\(")) { tex = raw.slice(2, -2); display = false; }
+    else {
+      tex = raw.slice(1, -1);
+      display = false;
+      /* قاعدة أمان $: لا يبدأ محتوى المعادلة ولا ينتهي بمسافة —
+         يمنع التهام رموز الدولار في نص عادي مثل «السعر 5$ والخصم 10$»
+         (النص السابق للمطابقة أُصدر فعليًا في السطر الذي قبل هذا الفرع) */
+      if (/^\s|\s$/.test(tex)) {
+        segs.push({ math: false, text: raw });
+        last = m.index + raw.length;
+        continue;
+      }
+    }
+    segs.push({ math: true, tex: tex.trim(), display });
+    last = m.index + raw.length;
+  }
+  if (last < src.length) segs.push({ math: false, text: src.slice(last) });
+  return segs;
+}
+
+/* تصيير مقطع LaTeX واحد عبر KaTeX — دون innerHTML لأي نص خارجي (آمن) */
+function katexSpan(tex, displayMode) {
+  const span = document.createElement("span");
+  span.className = "math-frag" + (displayMode ? " math-frag-display" : "");
+  span.setAttribute("dir", "ltr");
+  try {
+    window.katex.render(tex, span, {
+      displayMode: !!displayMode,
+      throwOnError: false,
+      strict: false,
+      trust: false,          /* أمان: لا \href ولا \includegraphics */
+      output: "htmlAndMathml",
+    });
+  } catch (e) {
+    span.classList.add("math-frag-error");
+    span.textContent = tex;  /* إبقاء الصيغة الأصلية ظاهرة عند الفشل */
+  }
+  return span;
+}
+
+/* شظية DOM لنص قصير (سؤال/خيار/تعليل/تلميح/سياق) مع تصيير المعادلات فقط
+   — دون Markdown، حفاظًا على بنية النصوص القصيرة كما هي */
+function mathRichFrag(text) {
+  const frag = document.createDocumentFragment();
+  const raw = String(text || "");
+  if (!hasMathSyntax(raw) || !katexReady()) {
+    frag.appendChild(document.createTextNode(raw));
+    return frag;
+  }
+  splitMathSegments(raw).forEach((seg) => {
+    if (!seg.math) {
+      if (seg.text) frag.appendChild(document.createTextNode(seg.text));
+      return;
+    }
+    if (seg.display) {
+      const wrap = document.createElement("div");
+      wrap.className = "math-display";
+      wrap.setAttribute("dir", "ltr");
+      wrap.appendChild(katexSpan(seg.tex, true));
+      frag.appendChild(wrap);
+    } else {
+      frag.appendChild(katexSpan(seg.tex, false));
+    }
+  });
+  return frag;
+}
+
+/* خانات السؤال والخيارات والتعليل: نص Markdown → مسار العارض الكامل (كما في نافذة الفقرة:
+   تحليل + تعقيم + KaTeX + جداول + اتجاه + Mermaid)، ونص عادي (ربما فيه معادلات) → mathRichFrag
+   كما هو دون تقسيم أسطر — فلا تتغير شكلية النصوص البسيطة إطلاقًا. */
+function richFieldFrag(text) {
+  const raw = String(text || "");
+  if (raw && looksLikeMarkdownText(raw) && ensureMarkdownParser()) {
+    return passageMarkdownFrag(raw, "");
+  }
+  return mathRichFrag(raw);
+}
+
+/* جملة بطاقة/سياق: تمييز الكلمة المفتاحية أو إخفاؤها مع تصيير المعادلات */
+function mathAwareSentenceFrag(text, keyword, blankMode) {
+  const raw = String(text || "");
+  if (!hasMathSyntax(raw) || !katexReady()) {
+    return blankMode ? blankKeywordFrag(raw, keyword) : highlightKeywordFrag(raw, keyword);
+  }
+  const frag = document.createDocumentFragment();
+  splitMathSegments(raw).forEach((seg) => {
+    if (seg.math) {
+      frag.appendChild(katexSpan(seg.tex, seg.display));
+      return;
+    }
+    frag.appendChild(blankMode ? blankKeywordFrag(seg.text, keyword) : highlightKeywordFrag(seg.text, keyword));
+  });
+  return frag;
+}
+
+/* إزالة محددات الرياضيات قبل القراءة الصوتية (TTS) — تُقرأ الصيغة نفسها لا علاماتها */
+function stripMathDelimiters(text) {
+  return String(text || "")
+    .replace(/\$\$|\$|\\\(|\\\)|\\\[|\\\]/g, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+/* إزالة ترميز Markdown قبل القراءة الصوتية — تُقرأ النصوص لا علامات التنسيق */
+function stripMdForSpeech(text) {
+  return String(text || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/~~~[\s\S]*?~~~/g, " ")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}[ \t]+/gm, "")
+    .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+    .replace(/(^|\W)__([^_\n]+)__/g, "$1$2")
+    .replace(/\*([^*\n]+)\*/g, "$1")
+    .replace(/~~([^~\n]+)~~/g, "$1")
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/^>[ \t]?/gm, "")
+    .replace(/^[ \t]*([-*+]|\d{1,3}[.)])[ \t]+/gm, "")
+    .replace(/\|/g, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+/* تصيير المعادلات داخل عقد نصية موجودة (ورقة الطباعة وما شابه المبني بـ innerHTML) */
+function renderMathInTextNodes(root) {
+  if (!katexReady() || !root) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || !hasMathSyntax(node.nodeValue)) return NodeFilter.FILTER_REJECT;
+      const p = node.parentElement;
+      if (!p || p.closest("script, style, pre, code, .katex, .math-frag")) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const targets = [];
+  let n;
+  while ((n = walker.nextNode())) targets.push(n);
+  targets.forEach((node) => {
+    const frag = document.createDocumentFragment();
+    splitMathSegments(node.nodeValue).forEach((seg) => {
+      if (!seg.math) {
+        if (seg.text) frag.appendChild(document.createTextNode(seg.text));
+        return;
+      }
+      frag.appendChild(katexSpan(seg.tex, seg.display));
+    });
+    node.parentNode.replaceChild(frag, node);
+  });
+}
+
+function passageMarkdownFrag(text, keyword) {
+  const wrap = document.createElement("div");
+  wrap.className = "md-body";
+  const parser = ensureMarkdownParser();
+  let html;
+  /* حجب الرياضيات أولًا (حتى لا يفسد المحلل \( و|) ثم جداول متساهلة ثم التصيير */
+  const mathMask = mdExtractMath(text);
+  try {
+    html = parser.render(mdPreprocessSource(mathMask.masked));
+  } catch (e) {
+    console.warn("[Markdown] render failed", e);
+    return passageLegacyFrag(text, keyword);
+  }
+  if (window.DOMPurify) {
+    html = window.DOMPurify.sanitize(html, {
+      ADD_ATTR: ["target", "rel", "dir", "align", "loading", "decoding"],
+      FORBID_TAGS: ["style", "form", "iframe"],
+      KEEP_CONTENT: true,
+    });
+  }
+  wrap.innerHTML = html;
+  mdRestoreMathText(wrap, mathMask.store);
+  applyMarkdownDirection(wrap);
+  wrapMarkdownTables(wrap);
+  enhanceMarkdownMedia(wrap);
+  collectMermaidBlocks(wrap);
+  renderMarkdownMath(wrap); /* المعادلات قبل تمييز الكلمات ليتخطى التمييز عناصر .katex */
+  highlightKeywordInMarkdown(wrap, keyword);
+  void renderMermaidBlocks(wrap); /* غير متزامن — الحاوية تُظهر مؤقتًا «جاري الرسم» */
+  const frag = document.createDocumentFragment();
+  frag.appendChild(wrap);
+  return frag;
+}
+
+function passageLegacyFrag(text, keyword) {
+  const frag = document.createDocumentFragment();
+  const lines = String(text || "").split(/\r?\n/);
+  let added = 0;
+  lines.forEach((rawLine) => {
+    const line = rawLine.trim();
+    if (!line) return;
+    let content = line;
+    const isHeading = looksLikePassageHeading(content);
+    if (/^#{1,6}\s+/.test(content)) content = content.replace(/^#{1,6}\s+/, "");
+    const p = document.createElement("p");
+    p.className = isHeading ? "passage-heading" : "passage-line";
+    p.appendChild(highlightKeywordFrag(content, keyword));
+    frag.appendChild(p);
+    added++;
+  });
+  if (!added) frag.appendChild(highlightKeywordFrag(text, keyword));
+  return frag;
+}
+
+function passageRichFrag(text, keyword) {
+  const raw = String(text || "");
+  if (raw && looksLikeMarkdownText(raw) && ensureMarkdownParser()) {
+    return passageMarkdownFrag(raw, keyword);
+  }
+  return passageLegacyFrag(raw, keyword);
+}
+
+function blankKeywordFrag(sentence, keyword) {
+  const frag = document.createDocumentFragment();
+  const text = String(sentence || "");
+  const kw = String(keyword || "").trim();
+  if (!kw) { frag.appendChild(document.createTextNode(text)); return frag; }
+  let re;
+  try {
+    re = new RegExp(kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+  } catch {
+    frag.appendChild(document.createTextNode(text));
+    return frag;
+  }
+  let last = 0, m, count = 0;
+  while ((m = re.exec(text)) && count < 3) {
+    if (m[0].length === 0) { re.lastIndex++; continue; }
+    frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const b = document.createElement("span");
+    b.className = "kw-blank";
+    b.textContent = "______";
+    frag.appendChild(b);
+    last = m.index + m[0].length;
+    count++;
+  }
+  frag.appendChild(document.createTextNode(text.slice(last)));
+  return frag;
+}
+
+function renderCard() {
+  const { cards, order, pos, recallOn } = cardsState;
+  const card = cards[order[pos]];
+  const fc = el("flashcard");
+  fc.classList.remove("flipped");
+  const front = fc.querySelector(".fc-front");
+  const back = fc.querySelector(".fc-back");
+  const labelF = front.querySelector(".fc-label");
+  const hintF = front.querySelector(".fc-hint");
+  const labelB = back.querySelector(".fc-label");
+  const hintB = back.querySelector(".fc-hint");
+  const kwEl = el("fc-keyword");
+  const sentEl = el("fc-sentence");
+
+  ["fc-blank", "fc-answer", "fc-assess"].forEach((id) => {
+    const old = document.getElementById(id);
+    if (old) old.remove();
+  });
+
+  el("cards-progress").textContent = t("cards_progress_fmt", { cur: pos + 1, total: order.length });
+  const fill = el("cards-progress-fill");
+  if (fill) fill.style.width = order.length ? ((pos + 1) / order.length) * 100 + "%" : "0";
+  el("btn-cards-prev").disabled = pos === 0;
+  el("btn-cards-next").disabled = pos === order.length - 1;
+
+  if (recallOn) {
+    labelF.textContent = t("fc_recall_front_label");
+    hintF.textContent = t("fc_recall_front_hint");
+    kwEl.style.display = "none";
+    const blank = document.createElement("p");
+    blank.className = "fc-blank";
+    blank.id = "fc-blank";
+    blank.appendChild(mathAwareSentenceFrag(card.sentence, card.keyword, true));
+    front.insertBefore(blank, hintF);
+    labelB.textContent = t("fc_recall_back_label");
+    hintB.textContent = t("fc_recall_back_hint");
+    const ans = document.createElement("strong");
+    ans.className = "fc-answer";
+    ans.id = "fc-answer";
+    ans.textContent = card.keyword;
+    back.insertBefore(ans, sentEl);
+    sentEl.innerHTML = "";
+    sentEl.appendChild(mathAwareSentenceFrag(card.sentence, card.keyword, false));
+    const row = document.createElement("div");
+    row.className = "fc-assess";
+    row.id = "fc-assess";
+    const ok = document.createElement("button");
+    ok.type = "button";
+    ok.className = "btn sm assess-ok";
+    ok.textContent = t("fc_know_btn");
+    ok.setAttribute("aria-label", t("fc_know_aria"));
+    ok.addEventListener("click", (e) => { e.stopPropagation(); assessCard(true); });
+    const again = document.createElement("button");
+    again.type = "button";
+    again.className = "btn sm assess-again";
+    again.textContent = t("fc_again_btn");
+    again.setAttribute("aria-label", t("fc_again_aria"));
+    again.addEventListener("click", (e) => { e.stopPropagation(); assessCard(false); });
+    row.appendChild(ok);
+    row.appendChild(again);
+    back.insertBefore(row, hintB);
+  } else {
+    labelF.textContent = t("fc_front_label");
+    hintF.textContent = t("fc_front_hint");
+    labelB.textContent = t("fc_back_label");
+    hintB.textContent = t("fc_back_hint");
+    kwEl.style.display = "";
+    kwEl.textContent = card.keyword;
+    sentEl.innerHTML = "";
+    sentEl.appendChild(mathAwareSentenceFrag(card.sentence, card.keyword, false));
+  }
+  refreshCardPassageButton(card);
+  updateRecallChip();
+}
+
+function refreshCardPassageButton(card) {
+  const back = el("flashcard").querySelector(".fc-back");
+  if (!back) return;
+  const stale = document.getElementById("fc-passage-btn");
+  if (stale) stale.remove();
+  if (!card || !getPassageForQuestion(card.qref)) return;
+  const hint = back.querySelector(".fc-hint");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.id = "fc-passage-btn";
+  btn.className = "btn sm passage-btn fc-passage-btn";
+  btn.innerHTML = BOOK_ICON;
+  btn.appendChild(document.createTextNode(t("btn_read_passage_short")));
+  btn.setAttribute("aria-label", t("aria_read_passage_kw", { kw: card.keyword || "" }));
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openPassageModal(card.qref);
+  });
+  if (hint) back.insertBefore(btn, hint);
+  else back.appendChild(btn);
+}
+
+function flipCard() {
+  el("flashcard").classList.toggle("flipped");
+}
+
+function setRecallMode(on) {
+  cardsState.recallOn = !!on;
+  cardsState.known = [];
+  cardsState.review = [];
+  const btn = el("btn-recall-mode");
+  btn.classList.toggle("active", cardsState.recallOn);
+  btn.setAttribute("aria-pressed", cardsState.recallOn ? "true" : "false");
+  el("recall-progress").classList.toggle("hidden", !cardsState.recallOn);
+  el("flashcard").classList.toggle("recall", cardsState.recallOn);
+  renderCard();
+  toast("info", cardsState.recallOn
+    ? t("toast_recall_on")
+    : t("toast_recall_off"));
+}
+
+function updateRecallChip() {
+  const chip = el("recall-progress");
+  if (!chip || !cardsState.recallOn) return;
+  chip.textContent = t("recall_progress_fmt", { known: cardsState.known.length, total: cardsState.cards.length, review: cardsState.review.length });
+}
+
+function assessCard(good) {
+  if (!cardsState.recallOn) return;
+  const idx = cardsState.order[cardsState.pos];
+  if (good) {
+    if (!cardsState.known.includes(idx)) cardsState.known.push(idx);
+    cardsState.review = cardsState.review.filter((i) => i !== idx);
+  } else {
+    if (!cardsState.review.includes(idx)) cardsState.review.push(idx);
+    cardsState.known = cardsState.known.filter((i) => i !== idx);
+  }
+  updateRecallChip();
+  const done = cardsState.known.length + cardsState.review.length;
+  if (done >= cardsState.cards.length) {
+    toast("success", t("toast_recall_done", { known: cardsState.known.length, review: cardsState.review.length }));
+  }
+  cardsState.pos = (cardsState.pos + 1) % cardsState.order.length;
+  renderCard();
+}
+
+function nextCard() {
+  if (cardsState.pos < cardsState.order.length - 1) { cardsState.pos++; renderCard(); }
+}
+
+function prevCard() {
+  if (cardsState.pos > 0) { cardsState.pos--; renderCard(); }
+}
+
+function shuffleCards() {
+  cardsState.order = shuffle([...cardsState.order]);
+  cardsState.pos = 0;
+  renderCard();
+  toast("info", t("toast_cards_shuffled"));
+}
+
+function exitCards() {
+  showScreen(lastResults ? "results" : "setup");
+}
+
+async function shareResults() {
+  if (!lastResults) return;
+  const { score, total, pct } = lastResults;
+  const text = state.staticQuestions
+    ? t("share_imported_text", { score, total, pct })
+    : t("share_own_text", { score, total, pct });
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: t("brand_name"), text });
+      toast("success", t("toast_shared_ok"));
+    } catch {}
+  } else {
+    await copyResults();
+  }
+}
+
+/* =========================================================
+   9) التنبيهات (Toasts)
+   ========================================================= */
+
+function toast(type, message) {
+  const box = el("toasts");
+  const t = document.createElement("div");
+  t.className = "toast " + (type || "info");
+  t.textContent = message;
+  box.appendChild(t);
+  setTimeout(() => {
+    t.classList.add("leaving");
+    setTimeout(() => t.remove(), 320);
+  }, 4200);
+}
+
+/* =========================================================
+   10) المظهر (فاتح/داكن)
+   ========================================================= */
+
+function initTheme() {
+  const saved = store.get("quiz_theme");
+  const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  setTheme(saved || (prefersDark ? "dark" : "light"));
+}
+
+function setTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  el("icon-moon").classList.toggle("hidden", theme === "dark");
+  el("icon-sun").classList.toggle("hidden", theme !== "dark");
+  store.set("quiz_theme", theme);
+}
+
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+  setTheme(cur);
+}
+
+/* =========================================================
+   11) النصوص التجريبية المتنوعة + رفع الملفات + أحداث الواجهة
+   ========================================================= */
+
+const SAMPLE_TEXTS = {
+  tech: `شهد العقد الأخير تحولًا جوهريًا في مشهد التعليم، حيث باتت منصات التعلم الإلكتروني تتنافس مع الفصول التقليدية على وقتهم واهتمام المتعلمين. لم يعد التعليم حكرًا على القاعات المدرسية، بل أصبح متاحًا بضغطة زر لأي شخص يمتلك اتصالًا بالإنترنت ورغبة في التعلم.
+
+وتقف الذكاء الاصطناعي في قلب هذا التحول، إذ باتت الأنظمة الذكية قادرة على تخصيص المسار التعليمي لكل طالب على حدة، فتحلل نقاط قوته وضعفه، ثم تقترح له المحتوى الأنسب لمستواه. هذا التخصيص الفردي كان حلمًا بعيد المنال في زمن التعليم الموحد للجميع.
+
+غير أن هذا التطور السريع أثار أسئلة جدية حول دور المعلم. فبعض المتفائلين يرون أن التقنية ستحرر المعلم من الأعمال الروتينية كالتصحيح وإعداد التقارير، ليتفرغ لما يتفرد به الإنسان: إلهام الطلاب، وبناء شخصياتهم، وتنمية مهاراتهم الاجتماعية والنفسية.
+
+في المقابل، يحذر الباحثون من مخاطر الإفراط في الاعتماد على الشاشات، ومن تراجع قدرة الطلاب على التركيز العميق والصبر على التعلم الشاق. تشير دراسات حديثة إلى أن القراءة السريعة والمتنقلة تنتج فهمًا سطحيًا، بينما يبقى الفهم العميق مرتبطًا بالقراءة المتأنية والمناقشة الحوارية.
+
+ويبدو أن مستقبل التعليم سيكون هجينًا يمزج بين مرونة التقنية ودفء العلاقة الإنسانية، فالمدرسة التي تتبنى الأدوات الذكية دون أن تفقد روحها الإنسانية هي الأقدر على إعداد جيل يواجه عالمًا يتغير بوتيرة متسارعة.`,
+
+  neuro: `يمتلك الدماغ البشري خاصية مذهلة تُعرف في العلوم العصبية باسم «المرونة العصبية» (Neuroplasticity)، وهي قدرة الشبكات العصبية على إعادة تنظيم نفسها وتكوين وصلات مشبكية جديدة طوال حياة الإنسان استجابةً للتعلم والخبرة وحتى الإصابات الدماغية.
+
+لطالما ساد الاعتقاد في القرن العشرين بأن بنية الدماغ تصبح ثابتة وغير قابلة للتغيير بعد انتهاء مرحلة الطفولة المبكرة، غير أن الأبحاث الحديثة باستخدام التصوير بالرنين المغناطيسي الوظيفي أثبتت أن تعلم مهارة جديدة كالعزف أو إتقان لغة أجنبية يغير الكثافة الرمادية في مناطق محددة من القشرة الدماغية.
+
+وتعتمد عملية تقوية الروابط العصبية على مبدأ هيب الشهير: «الخلايا العصبية التي تنشط معًا ترتبط معًا». فعندما نمارس استرجاع المعلومة مرارًا عبر الاختبار الذاتي المتباعد، يزداد تغليف الألياف العصبية بمادة الميالين، مما يضاعف سرعة انتقال الإشارات الكهربائية ودقتها.
+
+وفي المقابل، يخضع الدماغ لعملية موازية تُسمى «التقليم المشبكي»، حيث يتخلص تدريجيًا من المسارات العصبية المهملة التي لا تُستخدم لتوفير الطاقة الحيوية. ولهذا السبب يتلاشى الحفظ السطحي السريع بعد الامتحان، بينما ترسخ المعرفة التي جرى ربطها بسياقات متعددة وتطبيقات عملية.
+
+ويؤكد علماء الأعصاب أن النوم العميق والنشاط البدني الهوائي عنصران حاسمان لنجاح المرونة العصبية؛ فخلال النوم يعيد الحُصين (Hippocampus) تشغيل الذكريات المكتسبة نهارًا وينقلها إلى القشرة المخية للتخزين طويل الأمد.`,
+
+  history: `شكّل «بيت الحكمة» في بغداد خلال العصر العباسي الذهبي أول مؤسسة أكاديمية وبحثية كبرى جمعت بين خزانة الكتب، ومركز الترجمة، ومرصد الفلك، ومجلس المناظرة العلمية. وقد تطور من خزانة خاصة أسسها الخليفة هارون الرشيد ليبلغ ذروته في عهد المأمون مطلع القرن الثالث الهجري.
+
+لم تقتصر جهود العلماء في بيت الحكمة على النقل الحرفي للمؤلفات اليونانية والفارسية والهندية، بل تجاوزتها إلى النقد والتمحيص والتصحيح والابتكار. ففي أروقته وضع محمد بن موسى الخوارزمي كتابه «الجبر والمقابلة» الذي أسس علم الجبر الحديث كفرع مستقل عن الهندسة.
+
+وبرز في حركة الترجمة حنين بن إسحاق الذي أرسى منهجًا علميًا صارمًا يقوم على جمع النسخ المخطوطة المتعددة ومقابلتها، وترجمة المعنى الجملي السياقي بدل الترجمة الحرفية كلمةً بكلمة، مع نحت مصطلحات طبية وفلسفية عربية دقيقة لا تزال مستعملة حتى اليوم.
+
+كما ارتبط ببيت الحكمة مرصد الشماسية في بغداد ومرصد جبل قاسيون في دمشق، حيث قاس الفلكيون ميل فلك البروج ومحيط الأرض بطريقة علمية اعتمدت على قياس طول الدرجة الأرضية في صحراء سنجار، فجاءت نتائجهم قريبة جدًا من القياسات المعاصرة.
+
+وقد أسهم هذا المناخ العلمي المنفتح في حفظ التراث الإنساني من الضياع وتطوير المنهج التجريبي عند الحسن بن الهيثم والرازي والبيروني، قبل أن تنتقل هذه الذخائر العلمية عبر الأندلس وصقلية لتشعل جذوة النهضة الأوروبية.`,
+
+  econ: `يفترض الاقتصاد الكلاسيكي أن الإنسان كائن عقلاني تمامًا يسعى دائمًا لتعظيم منفعته الاقتصادية بعد موازنة دقيقة بين التكاليف والعوائد. غير أن «الاقتصاد السلوكي» الذي أرسى دعائمه دانيال كانيمان وآموس تفرسكي وريتشارد ثالر كشف أن القرارات البشرية اليومية تخضع لانحيازات معرفية وعاطفية منهجية.
+
+ومن أبرز هذه الظواهر «النفور من الخسارة» (Loss Aversion)، حيث يشعر الإنسان بألم نفسي عند خسارة مبلغ مالي يفوق بنحو الضعف حجم السعادة التي يشعر بها عند ربح المبلغ نفسه. وهذا يفسر تمسك المستثمرين بأسهم خاسرة أملًا في التعويض، أو تردد الأفراد في تغيير خياراتهم الافتراضية.
+
+كما يؤدي «انحياز الإرساء» (Anchoring Bias) دورًا خفيًا في التفاوض والتسعير؛ إذ يميل العقل البشري إلى الاعتماد المفرط على أول رقم يُعرض عليه (المرساة) بوصفه نقطة مرجعية للحكم على القيمة، حتى لو كان هذا الرقم عشوائيًا أو مبالغًا فيه.
+
+أما مفهوم «هندسة الاختيار» أو «النغز» (Nudge) الذي طوره ريتشارد ثالر، فيقوم على تصميم بيئة القرار بطريقة تحفز الأفراد على اتخاذ الخيار الأفضل لصحتهم أو مدخراتهم طوعًا ودون إكراه أو منع، مثل جعل الاشتراك في صندوق التقاعد خيارًا تلقائيًا مع بقاء حق الانسحاب متاحًا.`,
+
+  space: `تُعد الثقوب السوداء من أكثر الأجرام الكونية إثارة للدهشة في الفيزياء الفلكية، وهي مناطق في الفضاء بلغت فيها الكتلة كثافة هائلة إلى حد أن جاذبيتها تمنع أي شيء من الإفلات منها، بما في ذلك الفوتونات الضوئية نفسها.
+
+وتنشأ الثقوب السوداء النجمية عندما يستنفد نجم عملاق وقوده النووي فينهار قلبه تحت وطأة جاذبيته الذاتية في انفجار مستعر أعظم (سوبرنوفا). ويحيط بالثقب الأسود حدّ افتراضي يُعرف باسم «أفق الحدث» (Event Horizon)، وهو نقطة اللاعودة التي يستحيل بعدها لأي إشارة أن تصل إلى المراقب الخارجي.
+
+ووفقًا لنظرية النسبية العامة لألبرت أينشتاين، فإن الكتلة الهائلة للثقب الأسود تحني نسيج الزمكان بشدة، مما يؤدي إلى ظاهرة «تمدد الزمن الثقالي»؛ فالساعة القريبة من أفق الحدث تدق ببطء شديد مقارنة بساعة بعيدة عنه في الفضاء المفتوح.
+
+وفي عام 2019 نجح تلسكوب أفق الحدث (Event Horizon Telescope) — وهو شبكة عالمية من التلسكوبات الراديوية المتزامنة — في التقاط أول صورة مباشرة لظل الثقب الأسود الفائق الكتلة في مركز مجرة M87، مما قدم دليلًا رصديًا باهرًا يؤكد تنبؤات الفيزياء النظرية.`,
+};
+
+function updateCharCount() {
+  const raw = el("input-text").value;
+  const n = raw.length;
+  const trimmed = raw.trim();
+  const words = trimmed ? trimmed.split(/\s+/).length : 0;
+  el("char-count").textContent = t("char_count_fmt", { n });
+  const wc = el("word-count");
+  if (wc) wc.textContent = t("word_count_fmt", { n: words });
+  const rt = el("read-time");
+  if (rt) {
+    if (words >= 30) {
+      const mins = Math.max(1, Math.round(words / 180));
+      rt.textContent = t("read_time_fmt", { mins });
+      rt.classList.remove("hidden");
+    } else {
+      rt.classList.add("hidden");
+    }
+  }
+}
+
+function fillSample() {
+  const topicSel = el("sample-topic");
+  const key = (topicSel && topicSel.value) || "tech";
+  const pool = isEn() ? SAMPLE_TEXTS_EN : SAMPLE_TEXTS;
+  el("input-text").value = pool[key] || pool.tech;
+  updateCharCount();
+  el("input-text").focus();
+  toast("info", t("toast_sample_inserted"));
+}
+
+function clearText() {
+  el("input-text").value = "";
+  updateCharCount();
+  el("input-text").focus();
+}
+
+async function handleTextFileUpload(file) {
+  if (!file) return;
+  try {
+    const content = await file.text();
+    if (!content.trim()) {
+      toast("error", t("toast_file_empty"));
+      return;
+    }
+    el("input-text").value = content.trim();
+    updateCharCount();
+    toast("success", t("toast_file_loaded", { name: file.name }));
+  } catch {
+    toast("error", t("toast_file_err"));
+  }
+}
+
+function toggleKeyVisibility() {
+  const input = el("api-key");
+  const show = input.type === "password";
+  input.type = show ? "text" : "password";
+  el("icon-eye").classList.toggle("hidden", show);
+  el("icon-eye-off").classList.toggle("hidden", !show);
+}
+
+/* ====== قائمة النماذج ====== */
+function buildModelSelect() {
+  const sel = el("model-select");
+  sel.innerHTML = "";
+  const hasCustom = loadCustomModels();
+  const options = hasCustom
+    ? [...AI_MODELS]
+    : [...DEFAULT_AI_MODELS];
+
+  options.forEach((m) => {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    opt.textContent = m.label;
+    sel.appendChild(opt);
+  });
+  const customOpt = document.createElement("option");
+  customOpt.value = "__custom__";
+  customOpt.textContent = t("custom_models_opt");
+  sel.appendChild(customOpt);
+
+  if (hasCustom) {
+    sel.value = AI_MODELS[0].id;
+    el("custom-primary").value = AI_MODELS[0].id;
+    el("custom-fallback").value = AI_MODELS[1].id;
+    el("custom-status").textContent = t("custom_models_applied_status");
+  } else {
+    sel.value = DEFAULT_AI_MODELS[0].id;
+    setActiveModel(DEFAULT_AI_MODELS[0].id);
+  }
+}
+
+function onModelSelectChange() {
+  const sel = el("model-select");
+  if (sel.value === "__custom__") {
+    sel.value = AI_MODELS[0].id;
+    openCustomModelsModal();
+  } else {
+    setActiveModel(sel.value);
+  }
+}
+
+/* ====== نافذة النماذج المخصصة ====== */
+let customModelsReturnFocus = null;
+
+function isCustomModelsOpen() {
+  return !el("custom-models-overlay").classList.contains("hidden");
+}
+
+function openCustomModelsModal() {
+  if (isCustomModelsOpen()) return;
+  customModelsReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  el("custom-models-overlay").classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+  try { el("custom-primary").focus(); } catch {}
+}
+
+function closeCustomModelsModal() {
+  const ov = el("custom-models-overlay");
+  if (ov.classList.contains("hidden")) return;
+  ov.classList.add("hidden");
+  document.body.style.overflow = "";
+  if (customModelsReturnFocus && document.contains(customModelsReturnFocus)) {
+    try { customModelsReturnFocus.focus(); } catch {}
+  }
+  customModelsReturnFocus = null;
+}
+
+function trapCustomModelsTab(e) {
+  const focusables = [...el("custom-models-overlay").querySelectorAll("button, input, [tabindex='0']")]
+    .filter((n) => !n.disabled && n.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+function applyCustomModels() {
+  const primary = el("custom-primary").value.trim();
+  const fallback = el("custom-fallback").value.trim();
+  if (!primary || !fallback) {
+    toast("error", t("toast_enter_both_models"));
+    return;
+  }
+  saveCustomModels(primary, fallback);
+  buildModelSelect();
+  closeCustomModelsModal();
+  toast("success", t("toast_custom_applied", { p: primary, f: fallback }));
+}
+
+function resetModels() {
+  resetCustomModels();
+  buildModelSelect();
+  closeCustomModelsModal();
+  el("custom-status").textContent = t("toast_models_reset");
+  toast("info", t("toast_models_reset"));
+}
+
+/* ====== لوحة المفاتيح ====== */
+function onKeydown(e) {
+  if (isOverlayVisibleById("shortcuts-overlay")) {
+    if (e.key === "Escape") { e.preventDefault(); closeShortcutsModal(); }
+    else if (e.key === "Tab") { trapOverlayTab("shortcuts-overlay", e); }
+    return;
+  }
+  if (isOverlayVisibleById("study-guide-overlay")) {
+    if (e.key === "Escape") { e.preventDefault(); closeStudyGuideModal(); }
+    else if (e.key === "Tab") { trapOverlayTab("study-guide-overlay", e); }
+    return;
+  }
+  if (isOverlayVisibleById("save-list-overlay")) {
+    if (e.key === "Escape") { e.preventDefault(); closeSaveToListModal(); }
+    else if (e.key === "Tab") { trapOverlayTab("save-list-overlay", e); }
+    return;
+  }
+  if (isOverlayVisibleById("list-name-overlay")) {
+    if (e.key === "Escape") { e.preventDefault(); closeListNameModal(); }
+    else if (e.key === "Tab") { trapOverlayTab("list-name-overlay", e); }
+    return;
+  }
+  if (isCustomModelsOpen()) {
+    if (e.key === "Escape") { e.preventDefault(); closeCustomModelsModal(); }
+    else if (e.key === "Tab") { trapCustomModelsTab(e); }
+    return;
+  }
+  if (isPassageOpen()) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closePassageModal();
+    } else if (e.key === "Tab") {
+      trapPassageTab(e);
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      passageGo(document.documentElement.dir === "ltr" ? 1 : -1);
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      passageGo(document.documentElement.dir === "ltr" ? -1 : 1);
+    }
+    return;
+  }
+
+  const inInput = e.target && /^(input|textarea|select)$/i.test(e.target.tagName) && e.target.type !== "radio";
+  if (!inInput && (e.key === "?" || e.key === "؟")) {
+    e.preventDefault();
+    openShortcutsModal();
+    return;
+  }
+
+  if (el("screen-cards").classList.contains("active")) {
+    if (e.key === "ArrowLeft") { e.preventDefault(); document.documentElement.dir === "ltr" ? prevCard() : nextCard(); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); document.documentElement.dir === "ltr" ? nextCard() : prevCard(); }
+    else if ((e.key === " " || e.key === "Enter") && document.activeElement === el("flashcard")) { e.preventDefault(); flipCard(); }
+    return;
+  }
+  if (!el("screen-quiz").classList.contains("active") || !state.quiz) return;
+  if (inInput) return;
+
+  if (e.key >= "1" && e.key <= "4") {
+    const idx = parseInt(e.key, 10) - 1;
+    const label = el("options").children[idx];
+    if (!label) return;
+    const input = label.querySelector("input");
+    if (input && !input.disabled) {
+      input.checked = true;
+      input.dispatchEvent(new Event("change"));
+    }
+  } else if (e.key === "Enter") {
+    const q = state.rendered;
+    if (!q || q.userAnswer === null) return;
+    e.preventDefault();
+    nextQuestion();
+  } else if (/^[fFف]$/.test(e.key)) {
+    e.preventDefault();
+    activateFiftyLifeline();
+  } else if (/^[hHأ]$/.test(e.key)) {
+    e.preventDefault();
+    activateHintLifeline();
+  } else if (/^[sSس]$/.test(e.key)) {
+    e.preventDefault();
+    toggleStarCurrentQuestion();
+  } else if (/^[vVر]$/.test(e.key)) {
+    e.preventDefault();
+    speakCurrentQuestion();
+  } else if (/^[pPح]$/.test(e.key)) {
+    const q = state.rendered;
+    if (q && q.userAnswer !== null) {
+      e.preventDefault();
+      openPassageModal(q);
+    }
+  }
+}
+
+/* ====== التهيئة ====== */
+
+/* =====================================================================
+   12) تبديل لغة الواجهة (العربية / الإنجليزية)
+   ===================================================================== */
+function refreshDynamicUiForLang() {
+  buildModelSelect();
+  updateProQuotaUI();
+  syncDifficultyUI();
+  syncKwModeUI();
+  updateCharCount();
+  renderResume();
+  renderHistory();
+  renderListsOverview();
+  updateBrandBtn();
+  const sideBtn = el("btn-side-toggle");
+  const sideEl = el("setup-side");
+  if (sideBtn && sideEl) {
+    const collapsed = sideEl.classList.contains("collapsed");
+    const lbl = collapsed ? t("side_expand_title") : t("side_collapse_title");
+    sideBtn.title = lbl;
+    sideBtn.setAttribute("aria-label", lbl);
+  }
+  if (el("screen-lists") && el("screen-lists").classList.contains("active")) {
+    renderListsScreen();
+  }
+  if (el("screen-quiz") && el("screen-quiz").classList.contains("active")) {
+    setupRoundScreen();
+    updateQuizMeta();
+    if (state.rendered) {
+      if (state.rendered.userAnswer !== null) renderAnsweredQuestion(state.rendered);
+      else renderQuestion(state.rendered);
+    } else {
+      renderQuizDots();
+    }
+  }
+  if (el("screen-results") && el("screen-results").classList.contains("active") && lastResults) {
+    renderResults(
+      lastResults.score,
+      lastResults.total,
+      lastResults.elapsed,
+      lastResults.round,
+      lastResults.answers,
+      lastResults.bestStreak,
+      lastResults.pct
+    );
+  }
+  if (el("screen-cards") && el("screen-cards").classList.contains("active") && cardsState.cards.length) {
+    renderCard();
+    updateRecallChip();
+  }
+  if (isStudyGuideOpen()) {
+    openStudyGuideModal();
+  }
+}
+
+function setUiLang(lang, silent) {
+  uiLang = lang === "en" ? "en" : "ar";
+  try { localStorage.setItem(UI_LANG_KEY, uiLang); } catch {}
+  applyStaticTranslations();
+  refreshDynamicUiForLang();
+  if (typeof updateReminderStatusLine === "function") updateReminderStatusLine();
+  if (reminderSettings.on && notificationsGranted() && typeof syncPushSchedule === "function") syncPushSchedule(true); /* تحديث لغة إشعار الخادم */
+  if (!silent) toast("info", t("toast_lang_switched"));
+}
+
+function toggleUiLang() {
+  setUiLang(uiLang === "ar" ? "en" : "ar", false);
+}
+
+function init() {
+  uiLang = loadUiLang();
+  applyStaticTranslations();
+  initTheme();
+
+  el("theme-toggle").addEventListener("click", toggleTheme);
+  if (el("lang-toggle")) el("lang-toggle").addEventListener("click", toggleUiLang);
+
+  /* المفتاح */
+  el("api-key").value = loadApiKey();
+  el("api-key").addEventListener("input", () => saveApiKeyToStorage(el("api-key").value.trim()));
+  el("toggle-key").addEventListener("click", toggleKeyVisibility);
+
+  /* النماذج ونمط الأسئلة */
+  buildModelSelect();
+  el("model-select").addEventListener("change", onModelSelectChange);
+  el("btn-save-models").addEventListener("click", applyCustomModels);
+  el("btn-reset-models").addEventListener("click", resetModels);
+  el("btn-custom-models-close").addEventListener("click", closeCustomModelsModal);
+  el("custom-models-overlay").addEventListener("click", (e) => {
+    if (e.target === el("custom-models-overlay")) closeCustomModelsModal();
+  });
+
+  loadQType();
+  syncQTypeUI();
+  el("q-type").addEventListener("change", () => setQType(el("q-type").value));
+
+  /* وضع السرعة */
+  loadSpeedSettings();
+  syncSpeedInputs();
+  el("speed-mode").addEventListener("change", () => {
+    speedSettings.on = el("speed-mode").checked;
+    saveSpeedSettings();
+    toast("info", speedSettings.on ? t("toast_speed_on") : t("toast_speed_off"));
+  });
+  el("speed-seconds").addEventListener("change", () => {
+    speedSettings.secs = clampQuestionSecs(el("speed-seconds").value);
+    el("speed-seconds").value = String(speedSettings.secs);
+    saveSpeedSettings();
+    toast("info", t("toast_speed_secs", { s: speedSettings.secs, suffix: speedSettings.on ? "." : t("toast_speed_secs_inactive") }));
+  });
+
+  /* تذكير الاستئناف (v2.25): الميزة مخفية بالكامل — لإعادة تفعيلها اجعل REMINDER_FEATURE_ENABLED = true */
+  if (REMINDER_FEATURE_ENABLED) {
+    loadReminderSettings();
+    syncReminderUI();
+    syncReminderCycle();
+    el("reminder-toggle").addEventListener("click", onReminderToggle);
+    el("reminder-interval").addEventListener("change", onReminderIntervalChange);
+    el("reminder-custom").addEventListener("change", onReminderCustomChange);
+    el("reminder-unfinished").addEventListener("change", () => {
+      reminderSettings.onlyUnfinished = el("reminder-unfinished").checked;
+      saveReminderSettings();
+      syncReminderCycle();
+    });
+    el("btn-reminder-test").addEventListener("click", testReminderNotification);
+  } else {
+    hideReminderFeature();
+  }
+
+  /* النص + رفع ملف + السحب والإفلات */
+  el("input-text").addEventListener("input", updateCharCount);
+  el("btn-sample").addEventListener("click", fillSample);
+  el("btn-clear").addEventListener("click", clearText);
+  el("btn-upload-txt").addEventListener("click", () => el("upload-txt-file").click());
+  el("upload-txt-file").addEventListener("change", (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    handleTextFileUpload(f);
+  });
+
+  const dz = el("drop-zone");
+  const dh = el("drop-hint");
+  if (dz) {
+    ["dragenter", "dragover"].forEach((ev) => {
+      dz.addEventListener(ev, (e) => {
+        e.preventDefault();
+        dz.classList.add("dragover");
+        if (dh) dh.classList.remove("hidden");
+      });
+    });
+    ["dragleave", "drop"].forEach((ev) => {
+      dz.addEventListener(ev, (e) => {
+        e.preventDefault();
+        dz.classList.remove("dragover");
+        if (dh) dh.classList.add("hidden");
+      });
+    });
+    dz.addEventListener("drop", (e) => {
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) handleTextFileUpload(f);
+    });
+  }
+  updateCharCount();
+
+  /* أسلوب توليد الأسئلة + خلط الفقرات */
+  loadKwMode();
+  syncKwModeUI();
+  el("kw-mode").addEventListener("change", () => setKwMode(el("kw-mode").value));
+  el("shuffle-paragraphs").addEventListener("change", () => {
+    shuffleParagraphsOn = el("shuffle-paragraphs").checked;
+    store.set("quiz_shuffle_paras", shuffleParagraphsOn ? "1" : "0");
+    toast("info", shuffleParagraphsOn ? t("toast_shuffle_on") : t("toast_shuffle_off"));
+  });
+
+  /* «نموذج التحليل القوي»: تفعيل/تعطيل + عدّاد الرصيد اليومي */
+  loadProAnalyzePref();
+  el("pro-analyze-toggle").checked = proAnalyzeOn;
+  el("pro-analyze-toggle").addEventListener("change", () => {
+    proAnalyzeOn = el("pro-analyze-toggle").checked;
+    store.set("ai_pro_analyze", proAnalyzeOn ? "1" : "0");
+    updateProQuotaUI();
+    toast("info", proAnalyzeOn
+      ? (proQuotaRemaining() > 0
+        ? t("toast_pro_on_avail", { rem: proQuotaRemaining() })
+        : t("toast_pro_on_exhausted"))
+      : t("toast_pro_off"));
+  });
+  updateProQuotaUI();
+
+  /* تعليمات إضافية + القوالب السريعة */
+  loadExtraInstructions();
+  syncExtraInstructionsUI();
+  let extraSaveTimer = null;
+  el("extra-instructions").addEventListener("input", () => {
+    const ta = el("extra-instructions");
+    if (ta.value.length > MAX_EXTRA_INSTRUCTIONS) ta.value = ta.value.slice(0, MAX_EXTRA_INSTRUCTIONS);
+    updateExtraCount(ta.value);
+    clearTimeout(extraSaveTimer);
+    extraSaveTimer = setTimeout(() => {
+      setExtraInstructions(ta.value, true);
+      flashExtraSaved();
+    }, 600);
+  });
+  el("btn-extra-clear").addEventListener("click", () => {
+    el("extra-instructions").value = "";
+    setExtraInstructions("", false);
+  });
+  document.querySelectorAll(".preset-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const snippet = chip.dataset.preset || "";
+      if (!snippet) return;
+      const ta = el("extra-instructions");
+      const cur = ta.value.trim();
+      const next = cur ? (cur.includes(snippet) ? cur : cur + "\n" + snippet) : snippet;
+      ta.value = next.slice(0, MAX_EXTRA_INSTRUCTIONS);
+      setExtraInstructions(ta.value, false);
+      flashExtraSaved();
+    });
+  });
+
+  /* طي/فتح «تعليمات إضافية» بزر المثلث — مطوية افتراضيًا */
+  el("btn-extra-toggle").addEventListener("click", () => {
+    const btn = el("btn-extra-toggle");
+    const isOpen = btn.getAttribute("aria-expanded") === "true";
+    btn.setAttribute("aria-expanded", String(!isOpen));
+    el("extra-body").classList.toggle("hidden", isOpen);
+  });
+
+  /* طي/فتح القائمة الجانبية في شاشة الإعداد — بنمط «تعليمات إضافية» نفسه، والحالة محفوظة */
+  function syncSideToggle(collapsed) {
+    const btn = el("btn-side-toggle");
+    btn.setAttribute("aria-expanded", String(!collapsed));
+    const label = collapsed ? t("side_expand_title") : t("side_collapse_title");
+    btn.setAttribute("aria-label", label);
+    btn.title = label;
+  }
+  function loadSideCollapsed() {
+    const collapsed = store.get("quiz_side_collapsed") === "1";
+    el("setup-side").classList.toggle("collapsed", collapsed);
+    syncSideToggle(collapsed);
+  }
+  el("btn-side-toggle").addEventListener("click", () => {
+    const collapsed = !el("setup-side").classList.contains("collapsed");
+    el("setup-side").classList.toggle("collapsed", collapsed);
+    syncSideToggle(collapsed);
+    store.set("quiz_side_collapsed", collapsed ? "1" : "0");
+  });
+  loadSideCollapsed();
+
+  /* عدد الفقرات */
+  loadParaLimit();
+  syncParaLimitUI();
+  el("para-limit").addEventListener("change", () => {
+    syncParaLimitUI();
+    saveParaLimit();
+  });
+  el("para-limit-custom").addEventListener("change", () => {
+    if (String(el("para-limit-custom").value).trim()) {
+      el("para-limit-custom").value = String(clampParagraphLimit(el("para-limit-custom").value));
+    }
+    saveParaLimit();
+  });
+
+  /* لغة السؤال */
+  loadQuizLang();
+  syncQuizLangUI();
+  el("quiz-lang").addEventListener("change", () => setQuizLang(el("quiz-lang").value));
+
+  /* مستوى الصعوبة */
+  loadDifficulty();
+  syncDifficultyUI();
+  el("difficulty-seg").querySelectorAll(".seg-btn").forEach((b) => {
+    b.addEventListener("click", () => setDifficulty(b.dataset.level));
+  });
+
+  /* وسائل المساعدة وأدوات السؤال */
+  el("btn-fifty").addEventListener("click", activateFiftyLifeline);
+  el("btn-hint").addEventListener("click", activateHintLifeline);
+  el("btn-tts-q").addEventListener("click", speakCurrentQuestion);
+  el("btn-star-q").addEventListener("click", toggleStarCurrentQuestion);
+
+  /* الرحلة */
+  el("btn-start").addEventListener("click", startQuiz);
+  el("btn-cancel").addEventListener("click", () => {
+    if (state.abortCtrl) { try { state.abortCtrl.abort(); } catch {} }
+    stopPreparingAnimation();
+    showScreen("setup");
+  });
+  el("btn-next").addEventListener("click", nextQuestion);
+  el("btn-quit").addEventListener("click", quitQuiz);
+  el("btn-retake").addEventListener("click", retakeQuiz);
+  el("btn-new-text").addEventListener("click", backToSetup);
+  el("btn-copy").addEventListener("click", copyResults);
+  el("btn-share").addEventListener("click", shareResults);
+  el("btn-sound").addEventListener("click", toggleSound);
+  el("brand-home").addEventListener("click", goHomeFromBrand);
+  el("btn-clear-history").addEventListener("click", clearHistory);
+  el("btn-export-history").addEventListener("click", exportHistoryCSV);
+  document.querySelectorAll(".hist-range").forEach((btn) => {
+    btn.addEventListener("click", () => setHistoryRange(btn.dataset.range));
+  });
+
+  /* تصفية وبحث المراجعة */
+  document.querySelectorAll(".rev-filter").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      reviewFilter = btn.dataset.filter || "all";
+      document.querySelectorAll(".rev-filter").forEach((b) => b.classList.toggle("active", b === btn));
+      renderReviewList();
+    });
+  });
+  el("review-search").addEventListener("input", renderReviewList);
+
+  /* دليل الدراسة والاختصارات */
+  el("btn-study-guide").addEventListener("click", openStudyGuideModal);
+  el("btn-header-study").addEventListener("click", openStudyGuideModal);
+  el("btn-resume-study").addEventListener("click", openStudyGuideModal);
+  el("btn-study-guide-close").addEventListener("click", closeStudyGuideModal);
+  el("btn-sg-done").addEventListener("click", closeStudyGuideModal);
+  el("btn-sg-copy").addEventListener("click", copyStudyGuide);
+  el("sg-search").addEventListener("input", () => renderStudyGuideParagraphs());
+  el("study-guide-overlay").addEventListener("click", (e) => {
+    if (e.target === el("study-guide-overlay")) closeStudyGuideModal();
+  });
+
+  el("btn-shortcuts").addEventListener("click", openShortcutsModal);
+  el("btn-shortcuts-close").addEventListener("click", closeShortcutsModal);
+  el("btn-shortcuts-ok").addEventListener("click", closeShortcutsModal);
+  el("shortcuts-overlay").addEventListener("click", (e) => {
+    if (e.target === el("shortcuts-overlay")) closeShortcutsModal();
+  });
+
+  /* البطاقات */
+  el("btn-cards").addEventListener("click", openCards);
+  el("btn-cards-exit").addEventListener("click", exitCards);
+  el("flashcard").addEventListener("click", flipCard);
+  el("btn-cards-next").addEventListener("click", nextCard);
+  el("btn-cards-prev").addEventListener("click", prevCard);
+  el("btn-cards-shuffle").addEventListener("click", shuffleCards);
+  el("btn-recall-mode").addEventListener("click", () => setRecallMode(!cardsState.recallOn));
+  el("btn-export-json").addEventListener("click", exportJson);
+  el("btn-export-text").addEventListener("click", exportText);
+  el("btn-share-link").addEventListener("click", shareQuizLink);
+  el("btn-retry-wrong").addEventListener("click", retryWrongOnly);
+  el("btn-save-library").addEventListener("click", () => openSaveToListModal("results"));
+  el("btn-print").addEventListener("click", printQuiz);
+  el("btn-import").addEventListener("click", () => el("import-file").click());
+  el("import-file").addEventListener("change", (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    handleImportFile(f);
+  });
+  el("btn-resume").addEventListener("click", resumeSession);
+  el("btn-resume-dismiss").addEventListener("click", () => {
+    clearLastSession();
+    toast("info", t("toast_resume_removed"));
+  });
+  updateSoundIcon();
+  renderHistory();
+  renderResume();
+  renderListsOverview();
+  updateHeaderStudyBtn();
+
+  /* قوائم الحفظ + البحث والنسخ الاحتياطي */
+  loadLists();
+  el("btn-open-lists").addEventListener("click", () => {
+    listsUi.tabId = null;
+    renderListsScreen();
+    showScreen("lists");
+  });
+  el("btn-lists-back").addEventListener("click", () => {
+    renderListsOverview();
+    showScreen("setup");
+  });
+  el("lists-search").addEventListener("input", renderListsScreen);
+  el("btn-backup-export").addEventListener("click", exportFullBackup);
+  el("btn-backup-import").addEventListener("click", () => el("backup-import-file").click());
+  el("backup-import-file").addEventListener("change", (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    importFullBackup(f);
+  });
+  el("btn-new-list").addEventListener("click", () => openListNameModal("create"));
+  el("btn-list-rename").addEventListener("click", () => {
+    const ls = loadLists();
+    openListNameModal("rename", currentListId(ls));
+  });
+  el("btn-list-delete").addEventListener("click", deleteActiveList);
+  el("btn-save-quiz").addEventListener("click", () => openSaveToListModal("quiz"));
+  el("btn-resume-save").addEventListener("click", () => openSaveToListModal("last-session"));
+  el("btn-save-list-close").addEventListener("click", closeSaveToListModal);
+  el("btn-save-list-cancel").addEventListener("click", closeSaveToListModal);
+  el("btn-save-list-confirm").addEventListener("click", confirmSaveToList);
+  el("save-list-overlay").addEventListener("click", (e) => {
+    if (e.target === el("save-list-overlay")) closeSaveToListModal();
+  });
+  el("save-list-name").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); confirmSaveToList(); }
+  });
+  el("save-list-new-name").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); confirmSaveToList(); }
+  });
+  el("btn-list-name-close").addEventListener("click", closeListNameModal);
+  el("btn-list-name-cancel").addEventListener("click", closeListNameModal);
+  el("btn-list-name-confirm").addEventListener("click", confirmListName);
+  el("list-name-overlay").addEventListener("click", (e) => {
+    if (e.target === el("list-name-overlay")) closeListNameModal();
+  });
+  el("list-name-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); confirmListName(); }
+  });
+
+  document.addEventListener("keydown", onKeydown);
+
+  window.addEventListener("pagehide", () => updateSavedProgress());
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      updateSavedProgress();
+      return;
+    }
+    /* العودة من الخلفية: التقاط أي تذكير فائت فورًا (خطة أ) + تحديث جدولة الإشعارات (خطة ب + ج) */
+    reminderHeartbeat();
+    syncPushSchedule();
+    syncReminderTriggers();
+  });
+
+  /* نافذة الفقرة المنبثقة */
+  el("btn-passage-close").addEventListener("click", closePassageModal);
+  el("btn-passage-continue").addEventListener("click", closePassageModal);
+  el("btn-passage-prev").addEventListener("click", () => passageGo(-1));
+  el("btn-passage-next").addEventListener("click", () => passageGo(1));
+  el("btn-passage-tts").addEventListener("click", () => {
+    /* استنساخ لاستبعاد MathML المخفي من KaTeX (تجنب القراءة المزدوجة) ومخططات Mermaid */
+    const clone = el("passage-body").cloneNode(true);
+    clone.querySelectorAll(".katex-mathml, .md-mermaid").forEach((n) => n.remove());
+    const bodyText = (clone.innerText || clone.textContent || "").trim();
+    speakText(bodyText, el("btn-passage-tts"));
+  });
+  el("passage-overlay").addEventListener("click", (e) => {
+    if (e.target === el("passage-overlay")) closePassageModal();
+  });
+
+  checkHashQuiz();
+
+  /* استئناف مباشر عند القدوم من إشعار التذكير (?resume=1) —
+     يزال المعامل من الرابط عبر history.replaceState ثم يُستأنف آخر اختبار محفوظ */
+  if (new URLSearchParams(location.search).get("resume") === "1") {
+    try { history.replaceState(null, "", location.pathname + location.hash); } catch {}
+    setTimeout(() => { resumeFromReminder(); }, 350);
+  }
+
+  console.log("[اختبرني v2.25] جاهز — أدخل مفتاح API ثم ألصق نصك للبدء.");
+}
+
+/* ====== تسجيل Service Worker (PWA) والاستماع لرسائل الاستئناف (v2.20) ====== */
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("./sw.js").catch(() => {});
+  });
+  navigator.serviceWorker.addEventListener("message", (ev) => {
+    if (ev.data && ev.data.type === "resume-quiz") resumeFromReminder();
+  });
+}
+
+document.addEventListener("DOMContentLoaded", init);
